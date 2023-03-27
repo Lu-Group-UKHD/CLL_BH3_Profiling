@@ -1,0 +1,578 @@
+---
+title: "Figures for BH3 and drug responses analyses"
+author: "Junyan Lu"
+date: "2020 Sept 3"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = TRUE, dev = c("png","pdf"))
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#Packages
+library(jyluMisc)
+library(qgraph)
+library(cowplot)
+library(limma)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+library(SummarizedExperiment)
+library(tidyverse)
+```
+
+# Load and preprocess BH3 profiling data
+
+```{r, echo=FALSE, warning=FALSE}
+source("../code/utils.R")
+
+load("../output/dynamicBH3.RData")
+load("../../var/patmeta_200806.RData")
+load("../../var/IC50_170823.RData")
+```
+
+Use baseline level from DBP profiling
+```{r}
+dataBH3 <- dynamicBH3 %>% filter(drug == "DMSO", peptide!="DMSO") %>%
+  distinct(patID, feature, .keep_all = TRUE)
+
+dataBH3.auc <- dynamicBH3 %>% filter(drug == "DMSO", peptide!="DMSO") %>%
+  distinct(patID, peptide, .keep_all = TRUE) %>%
+  mutate(feature = peptide, value = AUC, concIndex ="AUC")
+```
+
+Prepare sample background annotations
+```{r}
+patAnno <- distinct(dataBH3, patID, sampleID) %>%
+  left_join(select(patMeta, Patient.ID, IGHV.status, trisomy12, Methylation_Cluster, TP53, gender), by = c(patID = "Patient.ID")) %>%
+  mutate(pretreat = treatmentTab[match(sampleID, treatmentTab$sampleID),]$pretreat) %>%
+  dplyr::rename(sex = gender)
+```
+
+Drug resposne data (IC50 screen)
+```{r, echo=FALSE}
+#Load and process drug response data
+#how many samples are tested in the BH3 profiling?
+overSample <- intersect(ic50$patientID, dataBH3$patID)
+#length(overSample)
+
+viabTab <- ic50 %>% filter(patientID %in% overSample, ! Drug %in% c("DMSO","PBS","bortezomib"), !is.na(concIndex)) %>%
+  group_by(patientID, Drug) %>% summarise(viab = mean(normVal_auc))
+
+
+
+viabMat <- pivot_wider(viabTab, names_from = patientID, values_from =viab) %>%
+  data.frame() %>% column_to_rownames("Drug") %>% as.matrix()
+```
+
+# Correlations between BH3 profile (AUC) and drug responses (AUC)
+
+## Correlation test
+```{r, echo=FALSE}
+#Process BH3 profiling data
+testTab <- dataBH3.auc %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) 
+
+#Process BH3 profiling data
+dataMat <- testTab %>% 
+  spread(key = patID, value = value) %>%
+  data.frame() %>% column_to_rownames("feature") %>%
+  as.matrix()
+
+dataMat <- dataMat[,colnames(viabMat)]
+
+testTab <- testTab %>%
+  full_join(viabTab, by = c(patID = "patientID"))
+
+#number of overlapped samples
+length(overSample)
+```
+
+```{r}
+corRes <- testTab %>% group_by(feature, Drug) %>% nest() %>%
+  mutate(m = map(data, ~cor.test(~ value + viab,.))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  ungroup() %>%
+  select(feature, Drug, estimate, p.value)  %>%
+  dplyr::rename(P.Value = p.value) %>%
+  mutate(adj.P.Val = p.adjust(P.Value, method= "BH"))
+```
+
+## P-Value summary plot
+```{r drugPsumPlot, fig.width=10, fig.height=5}
+fdrCut <- 0.1
+corRes.sig <- filter(corRes, adj.P.Val < 0.1)
+pCut <- max(corRes.sig$P.Value)
+drugOrder <- group_by(corRes.sig, Drug) %>% summarise(n = min(P.Value)) %>%
+  arrange(n)
+
+#color for peptide
+pepCol <- c(colList[1:length(unique(corRes.sig$feature))],"grey80")
+names(pepCol) <- c(unique(sort(corRes.sig$feature)),"not significant")
+
+plotTab <- corRes %>% select(feature, P.Value, Drug) %>%
+  filter(Drug %in% corRes.sig$Drug) %>%
+  mutate(peptide = ifelse(P.Value <= pCut, feature, "not significant")) %>%
+  mutate(Drug = factor(Drug, levels = drugOrder$Drug),
+         peptide = factor(peptide, levels = names(pepCol)))
+
+
+
+pSumPlot <- ggplot(plotTab, aes(x=Drug, y = -log10(P.Value), fill = peptide)) + 
+  geom_point(size=5, shape = 21, col = "grey50") +
+  scale_fill_manual(values = pepCol) +
+  geom_hline(yintercept = -log10(pCut), linetype = "dashed", col = "black") +
+  theme_full + 
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size=14)) +
+  xlab("") + ylab(bquote(-log[10]~"("*italic(P)~"value)"))
+
+pSumPlot
+ggsave("../figures/Fig4A_drugPsumPlot.pdf", width = 10, height = 5)
+```
+
+
+
+
+## Multi-variate model to test wehther BH3 profiling adds additional information
+
+Prepare genomics
+```{r}
+geneMat <-  patMeta[match(colnames(dataMat), patMeta$Patient.ID),] %>%
+  select(Patient.ID, IGHV.status, del11p:U1, -del5IgH, -IgH_break) %>% 
+  mutate_if(is.factor, as.character) %>% mutate(IGHV.status = ifelse(IGHV.status == "M", 1,0)) %>%
+  mutate_at(vars(-Patient.ID), as.numeric) %>% #assign a few unknown mutated cases to wildtype 
+  mutate_at(vars(-Patient.ID),replace_na,0) %>%
+  data.frame() %>% column_to_rownames("Patient.ID")
+
+geneMat <- geneMat[,apply(geneMat,2, function(x) sum(x %in% 1, na.rm = TRUE))>=5] %>% as.matrix()
+```
+
+**Genes that will be included in the multivariate model**
+```{r}
+colnames(geneMat)
+```
+
+### Test
+
+```{r}
+r2ComTab <- lapply(seq(nrow(corRes.sig)), function(i) {
+  Drug <- corRes.sig[i,]$Drug
+  feature <- corRes.sig[i,]$feature
+  compareR2(Drug, feature, geneMat, viabMat, dataMat)
+}) %>% bind_rows() %>% mutate(adj.p = p.adjust(p.value, method =  "BH")) %>%
+  filter(adj.p < 0.1) %>%
+  arrange(desc(r2Com))
+``` 
+
+```{r, fig.height=10, fig.width=8}
+r2ComTab.sig <- filter(r2ComTab, adj.p <= 0.1) %>% arrange(desc(r2Diff))
+r2ComTab.sig %>% mutate_if(is.numeric, formatC, digits=2) %>% DT::datatable()
+```
+
+### Number of associated drugs per peptide
+```{r, fig.width=10, fig.height=5}
+nDrugPep <- r2ComTab.sig %>% group_by(feature) %>% summarise(n = length(Drug)) %>%
+  arrange(desc(n)) %>% mutate(feature = factor(feature, levels = feature))
+
+ggplot(nDrugPep, aes(x=feature, y = n)) + geom_bar(stat= "identity", fill = colList[2]) +
+  theme_full + xlab("") + ylab("Number of significant associations")
+```
+
+### Summarising associations using network plot
+
+```{r, warning=FALSE}
+#get node list
+
+allNodeTab <- r2ComTab.sig %>% mutate(drugFeature = paste0(Drug,"_",feature)) 
+allNodes <- unique(c(allNodeTab$drugFeature, allNodeTab$feature))
+
+nodeList <- data.frame(id = seq(length(allNodes))-1, fullName = allNodes, stringsAsFactors = FALSE) %>%
+  separate(fullName, c("name","pep"), "_", remove = FALSE) %>%
+  mutate(type= ifelse(!is.na(pep),"target","source"))
+
+#get edge list
+edgeList <- select(allNodeTab, drugFeature, feature) %>%
+  dplyr::rename(Source = feature, Target = drugFeature) %>% 
+  mutate(Source = nodeList[match(Source,nodeList$fullName),]$id,
+         Target = nodeList[match(Target, nodeList$fullName),]$id) %>%
+  data.frame(stringsAsFactors = FALSE)
+
+nodeList$fullName <- NULL
+nodeList$pep <- NULL
+net <- graph_from_data_frame(vertices = nodeList, d=edgeList, directed = FALSE)
+```
+
+
+```{r drugPepNet, fig.height=10, fig.width=10}
+tidyNet <- as_tbl_graph(net)
+ggraph(tidyNet, layout =  "igraph", algorithm = "nicely") + 
+  geom_edge_link(width=1, linetype ="dashed", edge_colour = "gray50") + 
+  geom_node_point(aes(size=type, col= type)) + 
+  geom_node_text(aes(label = name), col=colList[1], repel = FALSE, fontface="bold", size=5) +
+  scale_color_manual(values = c(source = colList[7], target = "blue")) +
+  scale_size_manual(values = c(source=29, target=0))+
+  scale_edge_color_brewer(palette = "Set2") +
+  theme_graph() + theme(legend.position = "none") 
+ggsave("../figures/FigS8_drugPepNet.pdf", height = 10, width = 10)
+```
+
+### Plot interesing pairs
+
+#### Scatter plot of correlations
+```{r drugScatter, fig.height=13, fig.width=12}
+drugList <- c("nutlin-3", "navitoclax", "idelalisib", "duvelisib","orlistat",
+               "SNS-032", "NU7441")
+
+corPlotList <- lapply(drugList, function(n) {
+  seleTab <- filter(r2ComTab.sig, Drug == n) %>%
+    arrange(p.value)
+  dd <- seleTab[1,]$Drug
+  ff <- seleTab[1,]$feature
+  r <- formatC(-sqrt(seleTab[1,]$r2Feature),digits = 1)
+  p <- formatC(seleTab[1,]$p.value, digits=2)
+    
+  plotTab <- tibble(viab = viabMat[dd,], value = dataMat[ff,],
+                    patID = colnames(dataMat)) %>%
+    left_join(patAnno, by = "patID") %>%
+    mutate(TP53 = patMeta[match(patID, patMeta$Patient.ID),]$TP53)
+  geneVar <- ifelse(n == "nutlin-3","TP53","IGHV.status")
+  
+  ggplot(plotTab, aes(x=value, y=viab)) + geom_point(aes_string(fill = geneVar), shape =21, size=3) +
+    geom_smooth(method= "lm", se= FALSE, linetype = "dashed") + theme_full +
+    ylab("Viability") + xlab("Cyt C release") +
+    annotate(geom="text", label = bquote(italic("P"*"="*.(p)~"; coef="*.(r))), x = 70, y=1.1, col="red")+
+    ggtitle(paste0(ff, " ~ ", dd)) + theme(legend.position = "bottom") +
+    xlim(0,100) +ylim(0.2,1.2)
+})
+
+plot_grid(plotlist = corPlotList, ncol=3)
+ggsave("../figures/FigS10_drugCor.pdf", height = 13, width = 12)
+
+```
+
+#### Bar plot of explained variance
+```{r drugPepBar, fig.height=11, fig.width=11}
+barPlotList <- lapply(drugList, function(n) {
+  seleTab <- filter(r2ComTab.sig, Drug == n) %>%
+    arrange(p.value)
+  
+  plotTab <- tibble(
+    feature = c("genetics", seleTab$feature[1], paste0("genetics + ",seleTab$feature[1])),
+    r2 = c(seleTab[1,]$r2Gene, seleTab[1,]$r2Feature, seleTab[1,]$r2Com)) %>%
+    mutate(feature =factor(feature, levels = rev(feature)))
+  
+  ggplot(plotTab, aes(x=feature, y=r2)) + 
+    geom_bar(stat="identity", aes(fill = feature), width = 0.5) +
+    scale_fill_manual(values = colList[3:5]) +
+    ggtitle(n) +
+    coord_flip() + ylab("Variance explained (R2)") + xlab("") +
+    theme_full + theme(legend.position = "none", plot.margin = margin(5,10,5,10))
+})
+
+plot_grid(plotlist = barPlotList, ncol=2)
+ggsave("../figures/Fig4C_R2plot.pdf", height = 11, width = 11)
+```
+
+### Multi-variate feature selection with LASSO penalty
+
+#### Data pre-processing
+
+BH3 profiling
+```{r, message=FALSE}
+#Prepare BH3 data matrix
+bh3Mat <- dataBH3.auc %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix() 
+
+```
+
+Drug responses
+```{r}
+drugMat <- t(viabMat[r2ComTab.sig$Drug,])
+```
+
+For genomic data
+```{r}
+mMap <- c(HP=2,IP=1,LP=0)
+#Prepare genomic background
+genData <- patMeta[,c(1,9,11:ncol(patMeta))] %>% 
+  filter(Patient.ID %in% rownames(bh3Mat)) %>%
+  mutate_all(as.character) %>%
+  mutate(IGHV = ifelse(!is.na(IGHV.status),ifelse(IGHV.status == "M",1,0),NA)) %>%
+  select(-IGHV.status) %>%
+  mutate_at(vars(-Patient.ID), as.integer) %>%
+  data.frame() %>% column_to_rownames("Patient.ID")
+
+#remove gene with higher than 20% missing values
+genData <- genData[,colSums(is.na(genData))/nrow(genData) <= 0.2]
+
+#occurrence > 3
+genData <- genData[,colSums(genData,na.rm=TRUE) >3]
+
+#fill the missing value with majority
+genData <- apply(genData, 2, function(x) {
+  xVec <- x
+  mostFreq <- names(sort(table(xVec),decreasing = TRUE))[1]
+  xVec[is.na(xVec)] <- as.numeric(mostFreq)
+  xVec
+})
+```
+
+#### Training models
+
+Clean and integrate multi-omics data
+```{r}
+inclSet<-list(gen=genData,
+             BH3 = bh3Mat, drug= drugMat)
+cleanData <- generateData.drug(inclSet, censor = 5)
+```
+
+
+Perform lasso regression
+```{r, lasso all, cache=TRUE, warning=FALSE, message=FALSE}
+library(glmnet)
+lassoResults <- list()
+for (eachMeasure in names(cleanData$allResponse)) {
+  dataResult <- list()
+  for (eachDataset in names(cleanData$allExplain[[eachMeasure]])) {
+    y <- cleanData$allResponse[[eachMeasure]]
+    X <- cleanData$allExplain[[eachMeasure]][[eachDataset]]
+  
+   
+    glmRes <- runGlm(X, y, method = "lasso", repeats = 100, folds = 3)
+    dataResult[[eachDataset]] <- glmRes 
+  }
+  lassoResults[[eachMeasure]] <- dataResult
+  
+}
+```
+
+
+#### Ploting results
+
+Function for plotting variance explained for each measurement
+```{r drugR2, fig.height=12, fig.width=15, echo=F, warning=FALSE, message=FALSE}
+varList <- plotVar(lassoResults, maxY = 0.8)
+cowplot::plot_grid(plotlist = varList, ncol=4)
+ggsave("../figures/FigS11_varExp.pdf", height = 12, width = 15)
+```
+
+
+### Ploting selected features
+
+Plot all heatmaps
+```{r}
+heatMaps <- lassoPlot(lassoResults, cleanData, freqCut = 0.8)
+```
+
+```{r drugLASSOplot, fig.height=13, fig.width=8}
+heatMaps <- heatMaps[drugList]
+
+#prepare legend
+myCol <- colorRampPalette(c('dark red','white','dark blue'), space = "Lab")
+scaleSeq1 <- round(seq(0,1,0.01), digits=2)
+color4viab <- setNames(myCol(length(scaleSeq1+1)), nm=scaleSeq1)
+      
+Vgg = ggplot(data=data.frame(x=1, y=as.numeric(names(color4viab))), aes(x=x, y=y, color=y)) + geom_point() +
+  scale_color_gradientn(name="Z-score", colours =color4viab) + theme(legend.title=element_text(size=14), legend.text=element_text(size=12))
+pLegend <- get_legend(Vgg)
+
+plot_grid(plot_grid(plotlist= heatMaps, ncol=1), pLegend, ncol=2, rel_widths = c(1,0.1))
+ggsave("../figures/Fig4B_drugLassoPlot.pdf", height = 13, width = 8)
+```
+
+# Correlation between BH3 profile (individual concentrations) and drug responses (AUC)
+
+## Correlation test
+
+```{r, echo=FALSE}
+#Process BH3 profiling data
+testTab <- dataBH3 %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) 
+
+#Process BH3 profiling data
+dataMat <- testTab %>% 
+  spread(key = patID, value = value) %>%
+  data.frame() %>% column_to_rownames("feature") %>%
+  as.matrix()
+
+dataMat <- dataMat[,colnames(viabMat)]
+
+testTab <- testTab %>%
+  full_join(viabTab, by = c(patID = "patientID"))
+
+#number of overlapped samples
+length(overSample)
+```
+
+```{r}
+corRes <- testTab %>% group_by(feature, Drug) %>% nest() %>%
+  mutate(m = map(data, ~cor.test(~ value + viab,.))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  ungroup() %>%
+  select(feature, Drug, estimate, p.value)  %>%
+  dplyr::rename(P.Value = p.value) %>%
+  mutate(adj.P.Val = p.adjust(P.Value, method= "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+
+```
+
+## Summary heatmap plot for all concentrations
+
+```{r drugPheatmap, fig.width=14, fig.height=5, echo=FALSE}
+#prepare data table for plot 
+plotTab <- corRes %>% 
+  mutate(pSign = -log10(P.Value)*sign(estimate)) %>%
+  mutate(pSign = ifelse(adj.P.Val < 0.1, pSign, 0))
+
+#Order drugs by their association similarity (hierarchical clustering)
+pMat <- plotTab %>%
+  dplyr::select(Drug, pSign, feature) %>%
+  spread(key = feature, value = pSign) %>% data.frame() %>%
+  column_to_rownames("Drug") %>% as.matrix()
+
+keepDrug <- rownames(pMat)[rowSums(abs(pMat)) >0]
+pMat <- pMat[keepDrug,]
+
+drugOrder <- rownames(pMat)[hclust(dist(pMat), method = "ward.D2")$order]
+plotTab <- filter(plotTab, Drug %in% keepDrug) %>%
+  mutate(Drug = factor(Drug, levels = rev(drugOrder)))
+
+pSumHeat <- ggplot(plotTab, aes(x=factor(conc), y = Drug, fill = pSign)) + geom_tile(size = 0.3, color = "white") + 
+  facet_wrap(~ peptide, nrow = 1, scales = "free_x") + 
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", midpoint = 0,
+                       name = "-log10(P-Value)") +
+  #scale_x_continuous(breaks = scales::breaks_extended(n=4)) +
+  theme_full + theme(strip.text = element_text(face = "bold", size=15),
+                     axis.text.y = element_text(size =14),
+                     axis.text.x = element_text(size=14, angle = 90, hjust = 1, vjust = .5)) +
+  ylab("Drug") + xlab("Peptide concentration")
+pSumHeat
+ggsave("../figures/figS9_drugPheatMap.pdf", width = 14, height = 5)
+```
+
+# Correlation between BH3 profile (AUC) and drug (individual concentrations)
+```{r, echo=FALSE}
+viabTab.conc <- ic50 %>% filter(patientID %in% overSample, ! Drug %in% c("DMSO","PBS","bortezomib"), !is.na(concIndex)) %>%
+  group_by(patientID, Drug, concIndex, Concentration) %>% summarise(viab = mean(normVal))
+
+#Process BH3 profiling data
+testTab <- dataBH3.auc %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) 
+
+testTab <- testTab %>%
+  full_join(viabTab.conc, by = c(patID = "patientID"))
+
+#number of overlapped samples
+length(overSample)
+```
+
+```{r}
+corRes <- testTab %>% group_by(feature, Drug, concIndex, Concentration) %>% nest() %>%
+  mutate(m = map(data, ~cor.test(~ value + viab,.))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  ungroup() %>%
+  select(feature, Drug, estimate, p.value, concIndex, Concentration)  %>%
+  dplyr::rename(P.Value = p.value) %>%
+  mutate(adj.P.Val = p.adjust(P.Value, method= "BH"))
+```
+
+## Summary heatmap plot for drug concentrations
+
+```{r drugConcPheatmap, fig.width=18, fig.height=8, echo=FALSE}
+#prepare data table for plot 
+plotTab <- corRes %>% 
+  mutate(pSign = -log10(P.Value)*sign(estimate)) %>%
+  mutate(pSign = ifelse(adj.P.Val < 0.1, pSign, 0)) %>%
+  mutate(drugConc = paste0(Drug, "_", concIndex))
+
+#Order drugs by their association similarity (hierarchical clustering)
+pMat <- plotTab %>%
+  dplyr::select(drugConc, pSign, feature) %>%
+  spread(key = feature, value = pSign) %>% data.frame() %>%
+  column_to_rownames("drugConc") %>% as.matrix()
+
+keepDrug <- unique(filter(plotTab, drugConc %in% rownames(pMat)[rowSums(abs(pMat)) >0])$Drug)
+pMat <- pMat[unique(filter(plotTab, Drug %in% keepDrug)$drugConc),]
+
+#drugOrder <- rownames(pMat)[hclust(dist(pMat), method = "ward.D2")$order]
+plotTab <- filter(plotTab, Drug %in% keepDrug) #%>%
+  #mutate(Drug = factor(Drug, levels = rev(drugOrder)))
+
+pSumHeat <- ggplot(plotTab, aes(x=factor(concIndex), y = Drug, fill = pSign)) + geom_tile(size = 0.3, color = "white") + 
+  facet_wrap(~ feature, nrow = 1, scales = "free_x") + 
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", midpoint = 0,
+                       name = "-log10(P-Value)") +
+  theme_full + theme(strip.text = element_text(face = "bold"),
+                     axis.text.y = element_text(size =12),
+                     axis.text.x = element_text(size=12)) +
+  ylab("Drug") + xlab("Drug concentration index")
+pSumHeat
+```
+
+# Correlation with estimated in vivo responses
+
+```{r}
+load("../../var/inVivoEffect.RData")
+untreatSample <- filter(treatmentTab, pretreat %in% 0)$sampleID
+testTab <- filter(inVivoEffect, patientID %in% dataBH3.auc$patID) %>% 
+  pivot_longer(lymDrop:dropRate, names_to="measure",values_to="lymVal") %>%
+  left_join(dataBH3.auc, by = c(patientID = "patID")) %>%
+  filter(!is.na(lymVal), item %in% c("PCR")) 
+
+resTab <- testTab %>% group_by(item, measure, feature) %>%
+  nest() %>% mutate(nObs = map_int(data, nrow)) %>%
+  filter(nObs >= 3) %>%
+  mutate(m= map(data, ~cor.test(~lymVal + value,.))) %>%
+  mutate(res = map(m, broom::tidy)) %>%
+  unnest(res) %>% ungroup() %>%
+  select(feature, item, measure, estimate, p.value) %>%
+  arrange(p.value) %>% mutate(p.adj = p.adjust(p.value, method="BH")) 
+```
+
+## Table of significant associations (P<0.05)
+```{r}
+resTab.sig <- filter(resTab, p.value < 0.05)
+resTab.sig %>% mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+
+## Scatter plots showing significant associations (p <0.05)
+
+If multiple concentrations are identified as significant, only show the most significant concentration.
+```{r drugInVivo, fig.width=11, fig.height=5, echo=FALSE, warning=FALSE}
+plotList <- lapply(seq(nrow(resTab.sig)), function(i) {
+  featureName <- resTab.sig[i,]$feature
+  drugName <- resTab.sig[i,]$item
+  measureName <- resTab.sig[i,]$measure
+  yLab <- ifelse(measureName == "dropRate","lymphocyte count drop rate",
+                 "absolute lymphocyte count drop")
+  p <- formatC(resTab.sig[i,]$p.value,format = "e", digits = 2)
+  plotTab <- filter(testTab, feature == featureName,
+                    item == drugName, measure == measureName)
+  
+  ggplot(plotTab, aes(x=value, y = lymVal)) + 
+     geom_point(size=4) + geom_smooth(method = "lm", se=FALSE) +
+    xlab("Cyt C release") + ylab(yLab) +
+    scale_shape_manual(values = c(M=20, U=1)) +
+    ggtitle(paste0(featureName, " ~ ", drugName)) +
+    annotate(geom = "text", 
+             label = bquote(italic("P")~"="~.(p)),
+             x=-Inf, y=Inf, vjust =2, hjust=-0.1, size=6, color = "darkred") +
+    theme_full +
+    theme(legend.position = "none")
+})
+
+cowplot::plot_grid(plotlist = plotList, ncol=2)
+ggsave("../figures/Fig4D_drugInVivo.pdf", height = 5, width = 11)
+```
+
+

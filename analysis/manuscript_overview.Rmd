@@ -1,0 +1,1916 @@
+---
+title: "Overview of BH3 profile"
+author: "Junyan Lu"
+date: "2020 Sept. 3"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#Packages
+library(jyluMisc)
+library(qgraph)
+library(corrplot)
+library(cowplot)
+library(pheatmap)
+library(Cairo)
+library(limma)
+library(SummarizedExperiment)
+library(tidyverse)
+```
+
+# Load and preprocess BH3 profiling data
+
+Load
+```{r, echo=FALSE, warning=FALSE}
+source("../code/utils.R")
+
+load("../output/dynamicBH3.RData")
+load("../../var/patmeta_200806.RData")
+```
+
+  
+Use baseline level from DBP profiling
+```{r}
+dataBH3 <- dynamicBH3 %>% filter(drug == "DMSO", peptide != "DMSO") %>%
+  distinct(patID, peptide, .keep_all = TRUE) %>%
+  mutate(feature = peptide, value = AUC, concIndex =1)
+
+dataBH3.conc <- dynamicBH3 %>% filter(drug == "DMSO", peptide != "DMSO") %>%
+  distinct(patID, feature, .keep_all = TRUE)
+
+
+```
+
+Prepare sample background annotations
+```{r}
+patAnno <- distinct(dataBH3, patID, sampleID) %>%
+  left_join(select(patMeta, Patient.ID, IGHV.status, Methylation_Cluster,trisomy12, TP53, NOTCH1, gender), by = c(patID = "Patient.ID")) %>%
+  mutate(pretreat = treatmentTab[match(sampleID, treatmentTab$sampleID),]$pretreat) %>%
+  mutate(pretreat = ifelse(!is.na(pretreat), ifelse(pretreat==1, "yes","no"), NA),
+         trisomy12 = ifelse(!is.na(trisomy12), ifelse(trisomy12==1,"tri12","WT"), NA),
+         TP53 = ifelse(!is.na(TP53), ifelse(TP53==1,"Mut","WT"),NA),
+         NOTCH1 = ifelse(!is.na(NOTCH1), ifelse(NOTCH1==1,"Mut","WT"), NA)) %>%
+  dplyr::rename(sex = gender) %>%
+  mutate_all(as.character) %>%
+  mutate(age = ageTab[match(sampleID, ageTab$sampleID),]$age)
+
+geneColor <- c("HP" = colList[4], "IP" = colList[5], "LP" = colList[6],
+               M = colList[1], U=colList[2], tri12 = colList[1],
+               `1` = colList[1], `0` = colList[2],
+               Mut= colList[1], WT = colList[2], "n.a." = "grey50",
+               yes = colList[3],no=colList[4])
+
+```
+
+Save a table of patient information
+```{r, eval = FALSE}
+#library(DBI)
+#con <- dbConnect(RPostgreSQL::PostgreSQL(),
+#                 dbname = "tumorbank",
+#                 host = "huber-vm01.embl.de",
+#                 user = "admin",
+#                 password = "bloodcancertumorbank")
+
+#smpTab <- tbl(con, "sample") %>% collect()
+#sampleTab <- left_join(patAnno, smpTab, by = c(sampleID = "smpsampleid"))
+#write_csv2(sampleTab, "./tableS1_sampleSummary.csv")
+```
+
+# Data structure
+
+## Data dimension
+
+Number of samples
+```{r}
+length(unique(dataBH3$patID))
+```
+
+## Overview of CytC release data
+
+### For each concentration
+```{r Fig1B_absoluteCycRelease, fig.width=10, fig.height=4}
+plotTab <- dataBH3.conc %>% select(patID, peptide, conc, value, concIndex) %>% 
+  arrange(conc) %>% mutate(concName = paste0(conc,"μM")) %>% mutate(concName = factor(concName, levels = unique(concName)))
+
+orderPep <- group_by(plotTab, peptide) %>% summarise(medVal = median(value,na.rm=T)) %>%
+  arrange(medVal)
+
+plotTab <- mutate(plotTab, peptide = factor(peptide, levels = orderPep$peptide))
+labTab <- group_by(plotTab, concName, peptide, concIndex) %>%
+  summarise(yPos = max(value,na.rm=TRUE))
+ggplot(plotTab, aes(x=peptide, y = value)) + 
+  geom_point(aes(fill = factor(concIndex)),
+             position = position_dodge2(width = 1.5, preserve = "single"), shape=21, col = "grey80") +
+  geom_text(data = labTab, aes(x= peptide, y=yPos +1, group =concIndex, label = concName), 
+            position = position_dodge2(width = 1.5, preserve = "single"), size=4.5) +
+  scale_fill_brewer(type = "seq", palette="RdYlBu",direction =1) +
+  theme_full + theme(legend.position = "none") +
+  ylab("Cyt C release (%)") + xlab("")
+ggsave("../figures/Fig1B.pdf", width = 10, height = 4, device = cairo_pdf)
+```
+
+### For AUC
+```{r absoluteCycRelease_auc, fig.width=8, fig.height=5}
+plotTab <- dataBH3 %>% select(patID, peptide, value)
+
+orderPep <- group_by(plotTab, peptide) %>% summarise(medVal = median(value,na.rm=T)) %>%
+  arrange(medVal)
+
+plotTab <- mutate(plotTab, peptide = factor(peptide, levels = orderPep$peptide))
+ggplot(plotTab, aes(x=peptide, y = value)) + 
+  geom_point(aes(fill = peptide), 
+             position = position_dodge2(width = 0.5, preserve = "single"), shape=21, col = "grey80") +
+  theme_full + theme(legend.position = "none") +
+  ylab("Cyt C release (%)") + xlab("")
+```
+
+## Dose response curves
+
+```{r doseResponse, fig.width=12, fig.height=15}
+plotTab <- dataBH3.conc 
+plotList <- lapply(unique(plotTab$peptide), function(n) {
+  eachTab <- filter(plotTab, peptide == n) %>%
+    mutate(conc = factor(conc)) %>%
+    left_join(patAnno)%>%
+    mutate_at(vars(IGHV.status),replace_na,"n.a.")
+  ggplot(eachTab, aes(x=conc, y = value, group = patID, col = IGHV.status)) +
+    geom_point() + geom_line() + ggtitle(n) + theme_full +
+    coord_cartesian(ylim=c(-20, 100)) +
+    scale_color_manual(values = geneColor) +
+    xlab("Concentration (μM)") + ylab("Cyt C release")
+})
+
+plot_grid(plotlist = plotList,ncol=2)
+ggsave("../figures/FigS1_doseResponse.pdf", width = 12, height = 15, device = cairo_pdf)
+```
+
+## Hierarchical clustering and heatmaps
+
+```{r, echo=FALSE}
+#Prepare BH3 data matrix
+dataMat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+#prepare column annotations
+colAnno <- select(patAnno,-sampleID) %>% 
+  dplyr::rename(pretreatment = pretreat) %>%
+  data.frame() %>% column_to_rownames("patID")
+```
+
+```{r overviewHeatmap, fig.width=8, fig.height=8, echo=FALSE}
+
+callback = function(hc, mat){
+   sv = svd(t(mat))$v[,1]
+   dend = reorder(as.dendrogram(hc), wts = sv)
+   as.hclust(dend)
+}
+
+
+dataMat.scaled <- t(mscale(t(dataMat), censor = 4))
+colorAnno <- list(pretreatment = c(yes = colList[1], no = "white"),
+                  TP53 = c(Mut = colList[1], WT = "white"),
+                  NOTCH1 = c(Mut = colList[1], WT = "white"),
+                  trisomy12 = c(tri12 = colList[1],WT = "white"),
+                  sex = c(f = colList[3], m = colList[4]),
+                  Methylation_Cluster = c("HP" = colList[4], "IP" = colList[5], "LP" = colList[6]),
+                  IGHV.status = c(M = colList[1], U=colList[2]))
+p <- pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
+         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+         breaks = seq(-3,3, length.out =100), treeheight_row = 0, treeheight_col = 10, fontsize_col  = 15,
+         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, clustering_callback = callback,silent = TRUE)
+plot_grid(p$gtable)
+ggsave("../figures/Fig1C_overviewHeatmap.pdf",p$gtable, height = 7, width = 7)
+```
+
+## Pricipal component analysis
+
+
+```{r baselinePCA,fig.width=6, fig.height=6, echo=FALSE}
+#Prepare BH3 data matrix
+dataMat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+pcRes <- prcomp(dataMat, center = TRUE, scale. = T)
+
+plotTab <- pcRes$x[,1:5] %>% data.frame() %>%
+  rownames_to_column("patID") %>%
+  left_join(patAnno, by = "patID") %>%
+  filter(!is.na(IGHV.status),!is.na(trisomy12)) %>%
+  mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+         tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+  mutate(group = paste0(IGHV, tri12))
+
+varExp = (pcRes$sdev^2)/sum(pcRes$sdev^2)
+
+pairedCol <- RColorBrewer::brewer.pal(8,"Paired")
+groupColor <- c("U-CLL, no tri12" = pairedCol[1],
+             "U-CLL, tri12" = pairedCol[2],
+             "M-CLL, no tri12" = pairedCol[5],
+             "M-CLL, tri12" = pairedCol[6])
+shapeAnno <- c("U-CLL, no tri12" = 16,
+             "U-CLL, tri12" = 17,
+             "M-CLL, no tri12" = 16,
+             "M-CLL, tri12" = 17)
+
+ggplot(plotTab, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color = group, shape = group), size=3) + 
+  theme_bw() + xlim(-5,5) + ylim(-5,5) +
+  scale_color_manual(values = groupColor, name = "") +
+  scale_shape_manual(values = shapeAnno, name = "") +
+  xlab(sprintf("PC1 (%1.1f%%)", 100*varExp[1])) + ylab(sprintf("PC2 (%1.1f%%)", 100*varExp[2])) +
+  theme(legend.position = "bottom")
+```
+
+### PCA biplot
+
+```{r baselinePCA_biplot, fig.width=5, fig.height=5, echo=FALSE}
+PCbiplot <- function(PC, x="PC1", y="PC2") {
+    # PC being a prcomp object
+    varExp = (pcRes$sdev^2)/sum(pcRes$sdev^2)
+    
+    plotTab <- pcRes$x %>% data.frame() %>% rownames_to_column("patID") %>%
+      left_join(patAnno, by = "patID") %>%
+      filter(!is.na(IGHV.status),!is.na(trisomy12))  %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12))
+
+    p <- ggplot(plotTab, aes(x=PC1, y=PC2)) + 
+          geom_point(aes(color = group, shape = group), size=3) + 
+          theme_bw() + xlim(-5,5) + ylim(-5,5) +
+          scale_color_manual(values = groupColor, name = "") +
+          scale_shape_manual(values = shapeAnno, name = "") +
+          xlab(sprintf("PC1 (%1.1f%%)", 100*varExp[1])) + ylab(sprintf("PC2 (%1.1f%%)", 100*varExp[2])) +
+  theme(legend.position = "bottom")
+
+    datapc <- data.frame(varnames=rownames(PC$rotation), PC$rotation)
+    mult <- min(
+        (max(plotTab[,y]) - min(plotTab[,y])/(max(datapc[,y])-min(datapc[,y]))),
+        (max(plotTab[,x]) - min(plotTab[,x])/(max(datapc[,x])-min(datapc[,x])))
+        )
+    datapc <- transform(datapc,
+            v1 = .7 * mult * (get(x)),
+            v2 = .7 * mult * (get(y))
+            )
+    p <- p + 
+      ggrepel::geom_text_repel(data=datapc, aes(x=v1, y=v2, label=varnames), size = 5, vjust=1, color=colList[3])
+    p <- p + geom_segment(data=datapc, aes(x=0, y=0, xend=v1, yend=v2), arrow=arrow(length=unit(0.2,"cm")), alpha=0.4, color=colList[3])
+    p
+}
+
+PCbiplot(pcRes) + theme_full + theme(legend.position = c(0.81,0.15), legend.background = element_rect(fill = NA))
+ggsave("../figures/Fig1D_PCA.pdf", height = 5, width = 5)
+```
+
+### Associations between PCs and patient background
+```{r}
+testTab <- pcRes$x[,1:3] %>% data.frame() %>%
+  rownames_to_column("patID") %>%
+  left_join(patAnno, by = "patID") %>% select(-sampleID) %>%
+  pivot_longer(starts_with("PC"), names_to = "PC", values_to = "val") %>%
+  mutate_at(vars(IGHV.status:pretreat), as.character) %>%
+  pivot_longer(IGHV.status:pretreat, names_to = "feature", values_to = "status")
+
+corRes <- group_by(testTab, PC, feature) %>% nest() %>%
+  mutate(m = map(data, ~(car::Anova(lm(val ~ status,.))))) %>%
+  mutate(res = map(m, broom::tidy)) %>%
+  unnest(res) %>% filter(term == "status") %>%
+  select(PC, feature, p.value) %>% arrange(p.value)
+```
+
+Associations with P-value < 0.05
+```{r }
+corRes.sig <- filter(corRes, p.value < 0.05)
+corRes.sig
+```
+
+**Plot associations**
+```{r associationBox, fig.height=8, fig.width=12}
+corRes.sig <- arrange(corRes.sig, PC, feature)
+give.n <- function(x){
+   return(data.frame(y = quantile(x,0.75), label = paste0("n=",length(x))))
+}
+
+pList <- lapply(seq(nrow(corRes.sig)), function(i) {
+  
+  featureName <- corRes.sig[i,]$feature
+  pc <- corRes.sig[i,]$PC
+  p <- formatC(corRes.sig[i,]$p.value, digits = 2)
+  pText <- bquote(italic("P")~"="~.(p))
+  
+  plotTab <- filter(testTab, feature == featureName, PC == pc) %>%
+    filter(!is.na(status)) %>%
+    mutate(status = ifelse(status == "0", "WT", ifelse(status == "1","Mut",status)))
+    
+  ggplot(plotTab, aes(x=status, y = val, fill = status)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= geneColor) +
+    ylab(pc) + xlab("") +
+    ggtitle(sprintf("%s ~ %s", pc, featureName)) +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=0.5), size=6) +
+    annotate("text", x=-Inf, y=Inf, label = pText, hjust=-0.5, vjust=2, color = colList[[1]]) +
+    theme_full +
+    theme(legend.position = "none")
+
+})
+cowplot::plot_grid(plotlist= pList, ncol=2)
+ggsave("../figures/Fig1E_boxplot.pdf", height = 6, width = 10)
+```
+
+**Plot feature loadings on the first three PCs**
+```{r, fig.width=10, fig.height=6}
+loadTab <- pcRes$rotation %>% data.frame() %>% 
+  rownames_to_column("feature") %>% select(feature,PC1:PC3) %>%
+  pivot_longer(PC1:PC3, names_to = "PC", values_to="loading")
+ggplot(loadTab, aes(x=feature, y = loading, fill = PC)) +
+  geom_bar(stat = "identity", position = position_dodge2( width = 0.1)) + theme_full + 
+  scale_fill_manual(values= colList) +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5),panel.grid.major.x=element_line(color="grey80"))
+```
+
+## Feature correlations
+
+### AUC
+
+```{r}
+#Prepare BH3 data matrix
+dataMat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+```
+
+```{r featureCorAUC, fig.width=5, fig.height=5}
+#function to do correlation test on matrix
+cor.mtest <- function(mat1, mat2=NULL, conf.level = 0.99) {
+   if(is.null (mat2)) mat2 <- mat1
+  
+    mat1 <- as.matrix(mat1)
+    mat2 <- as.matrix(mat2)
+    stopifnot(ncol(mat1) == ncol(mat2))
+    n1 <- nrow(mat1)
+    n2 <- nrow(mat2)
+    
+    p.mat <- cor.rho <- matrix(NA, n1, n2)
+    for (i in 1:n1) {
+        for (j in 1:n2) {
+            tmp <- cor.test(mat1[i, ], mat2[j, ], conf.level = conf.level, 
+                            use="pairwise.complete.obs",method="pearson")
+            p.mat[i, j] <- tmp$p.value
+            cor.rho[i, j] <- tmp$estimate[[1]]
+        }
+    }
+    colnames(cor.rho) <- colnames(p.mat) <- rownames(mat2)
+    rownames(cor.rho) <- rownames(p.mat) <- rownames(mat1)
+    
+    return(list(cor.rho, p.mat))
+}
+
+featureCor <- cor.mtest(t(dataMat))
+
+#correlation heatmap
+corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
+pdf("../figures/FigS2_featureCorAUC.pdf", height = 5, width = 5)
+corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
+dev.off()
+```
+
+
+### Individual concentrations
+
+```{r}
+#Prepare BH3 data matrix
+dataMat <- dataBH3.conc %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+```
+
+```{r featureCorConc, fig.width=10, fig.height=10}
+featureCor <- cor.mtest(t(dataMat))
+
+#correlation heatmap
+corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
+pdf("../figures/FigS3_featureCorConc.pdf", height = 10, width = 10)
+corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
+dev.off()
+```
+
+# Association test with patient genomic background
+
+Prepare patient genomic background
+```{r, echo=FALSE}
+#Prepare genomic background
+patBack <- patMeta[patMeta$Patient.ID %in% dataBH3$patID,c(1,9: ncol(patMeta))] %>% 
+  mutate(IGHV.status = as.character(IGHV.status)) %>% 
+  mutate(IGHV.status = ifelse(!is.na(IGHV.status),ifelse(IGHV.status == "M",1,0),NA)) %>%
+  mutate_if(is.factor, as.character) %>% mutate_at(vars(-Patient.ID), as.integer) %>%
+  data.frame() %>% column_to_rownames("Patient.ID")
+
+#all patients are in patMeta?
+#all(unique(dataBH3$patientID) %in% rownames(patBack))
+#only keep feature with at least 5 mutated cases
+patBack <- patBack[,colSums(patBack, na.rm = TRUE ) > 5]
+
+patBack <- data.frame(patBack)
+patBack <- patBack[,!colnames(patBack)%in%c("del5IgH", "IgH_break")]
+colnames(patBack)
+
+geneTab <- data.frame(patBack) %>% rownames_to_column("patID") %>%
+  pivot_longer(-patID, names_to = "Gene", values_to = "status")
+```
+
+
+### Plot to summarise genomic background
+```{r}
+sortTab <- function(sumTab) {
+  i <- ncol(sumTab)
+  #print(i)
+  if (i == 1) {
+    #print(rownames(sumTab)[order(sumTab[,i])])
+    return(rownames(sumTab)[order(sumTab[,i])])
+  }
+  orderRow <- c(sortTab(sumTab[sumTab[,i]==0, seq(1,i-1), drop = FALSE]), sortTab(sumTab[sumTab[,i]==1, seq(1,i-1), drop = FALSE]))
+  return(orderRow)
+}
+
+geneMat.sort <- patBack
+geneMat.sort[is.na(geneMat.sort)] <- 0
+sortedGene <- names(sort(colSums(geneMat.sort)))
+geneMat.sort <- geneMat.sort[,sortedGene]
+sortedPat <- sortTab(geneMat.sort)
+```
+
+```{r geneSummary, fig.height=6, fig.width=15}
+plotTab <- patBack %>% rownames_to_column("patID") %>% mutate_all(as.character) %>%
+  gather(key = "gene", value = "status", -patID) %>%
+  mutate(gene = factor(gene, levels = sortedGene), patID = factor(patID, levels = sortedPat)) %>%
+  mutate(status = ifelse(is.na(status),"NA",status))
+
+ggplot(plotTab, aes(x=patID, y = gene, fill = status)) + 
+  geom_tile(color = "black") +
+  theme_minimal() + 
+  scale_fill_manual(values = c("1" = colList[4],"0" ="white", "NA" = "grey80")) +
+  theme(axis.text.x = element_text(angle = 90, hjust =1, vjust=0.5),
+        panel.grid = element_blank(), legend.position = "none") +
+  ylab("") + xlab("Patient ID")
+```
+
+## Association test 
+Test for Genomics
+```{r}
+testTab <- dataBH3 %>% select(patID, feature, value) %>% full_join(geneTab, by = "patID") %>%
+  filter(!is.na(value), !is.na(status))
+resTab.gene <-  group_by(testTab, feature, Gene) %>% nest() %>%
+  mutate(m = map(data, ~t.test(value ~ status,.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  select(feature, Gene, p.value, estimate) 
+```
+
+Methylation cluster
+```{r}
+testTab <- dataBH3 %>%
+  mutate(MC = patMeta[match(patID, patMeta$Patient.ID),]$Methylation_Cluster) %>%
+  filter(!is.na(MC))
+
+resTab.meth <- group_by(testTab, feature) %>% nest() %>%
+  mutate(m = map(data, ~car::Anova(lm(value ~ MC,.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  filter(term=="MC") %>%
+  mutate(Gene = "Methylation_Cluster") %>%
+  select(feature, Gene, p.value) 
+```
+
+```{r}
+resTab <- bind_rows(resTab.gene, resTab.meth) %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = "BH")) %>%
+  arrange(p.value)
+```
+
+## Table of associations
+```{r}
+resTab.sig <- filter(resTab, p.adj < 0.1)
+resTab.sig %>% mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## P value scatter plot
+```{r genePscatter, fig.width=5, fig.height=6}
+fdrCut <- 0.1
+resTab.sig <- filter(resTab, p.adj < fdrCut)
+pCut <- max(resTab.sig$p.value)
+pepOrder <- group_by(resTab, feature) %>% summarise(n = min(p.value)) %>%
+  arrange(desc(n))
+
+plotTab <- resTab %>% 
+  mutate(direction = ifelse(p.value > pCut, "not significant", 
+                            ifelse( estimate < 0, "up in Mut", "down in Mut"))) %>%
+  mutate(feature = factor(feature, levels = pepOrder$feature))
+
+
+
+pSumPlot <- ggplot(plotTab, aes(x=feature, y = -log10(p.value), col = direction)) + 
+  geom_point(size=3) +
+  scale_color_manual(values = c(`not significant` = "grey80",
+                                `up in Mut` = colList[1],
+                                `down in Mut` = colList[2])) +
+  coord_flip() +
+  theme_bw() + 
+  ggrepel::geom_text_repel(data = filter(plotTab, direction != "not significant"),
+                           aes(label = Gene), col = "black", size= 4) +
+  geom_hline(yintercept = -log10(pCut), linetype = "dashed", col = "black") +
+  ylim(0,4) +
+  theme_full +
+  theme(legend.position = c(0.75,0.2), legend.text = element_text(size=12), legend.title = element_text(size=12)) + 
+  xlab("") + ylab(bquote(-log[10]~"("*italic("P")~"value)"))
+
+pSumPlot
+ggsave("../figures/Fig2A_genePscatter.pdf", width = 5, height = 6)
+```
+
+## Box plots for the significant associations (10% FDR)
+
+If multiple concentrations are identified as significant, only show the most significant concentration.
+```{r geneAssociationBox, fig.width=10, fig.height=10}
+pscr <- filter(resTab, p.adj < 0.1) %>%
+  mutate(Gene = factor(Gene, levels = c("trisomy12","IGHV.status","del17p","NOTCH1"))) %>%
+  arrange(Gene)
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  geneName <- pscr[i,]$Gene
+  p <- pscr[i,]$p.value
+  p <- formatC(p, digits = 2)
+  pText <- bquote(italic("P")~"="~.(p))
+  
+  plotTab <- filter(dataBH3, feature == featureName) %>%
+    mutate(gene = as.character(patMeta[match(patID, patMeta$Patient.ID),][[geneName]])) %>%
+    filter(!is.na(gene)) %>%
+    mutate(gene = ifelse(gene == "0", "WT", ifelse(gene == "1","Mut",gene)))
+  if (geneName == "trisomy12")
+    plotTab <- mutate(plotTab, gene = str_replace(gene, "Mut","tri12"))
+  
+  ggplot(plotTab, aes(x=gene, y = value, fill = gene)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= geneColor) +
+    ylab("Cyt C release") + xlab("") +
+    ggtitle(sprintf("%s ~ %s", featureName, geneName)) +
+    #geom_text(aes(label = gene),y = max(plotTab$value), stat = "count") +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5), size=6) +
+    annotate("text", x=-Inf, y=Inf, label = pText, hjust=-0.3, vjust=2, color = colList[[1]]) +
+    theme_full +
+    theme(legend.position = "none")
+})
+cowplot::plot_grid(plotlist = plotList, ncol=2)
+ggsave("../figures/Fig2B_geneAssociationBox.pdf", width = 10, height = 10)
+```
+
+
+## Genomic correlation with individual concentrations
+
+### Association test
+```{r}
+testTab <- dataBH3.conc %>% select(patID, feature, value) %>% full_join(geneTab, by = "patID") %>%
+  filter(!is.na(value), !is.na(status))
+corRes <-  group_by(testTab, feature, Gene) %>% nest() %>%
+  mutate(m = map(data, ~t.test(value ~ status,.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>% ungroup() %>%
+  mutate(P.Value = p.value, adj.P.Val = p.adjust(p.value, method ="BH")) %>%
+  select(feature, Gene, P.Value, adj.P.Val, estimate)%>%
+  left_join(distinct(dataBH3.conc, feature, peptide, conc, concIndex)) %>%
+  arrange(P.Value)
+```
+
+### Summary heatmap plot for all concentrations
+
+```{r genePheatmapConc, fig.width=18, fig.height=6, echo=FALSE}
+#prepare data table for plot 
+plotTab <- corRes %>% 
+  mutate(pSign = -log10(P.Value)*sign(estimate)) %>%
+  mutate(pSign = ifelse(P.Value < 0.05, pSign, 0))
+
+#Order drugs by their association similarity (hierarchical clustering)
+pMat <- plotTab %>%
+  dplyr::select(Gene, pSign, feature) %>%
+  spread(key = feature, value = pSign) %>% data.frame() %>%
+  column_to_rownames("Gene") %>% as.matrix()
+
+keepGene <- rownames(pMat)[rowSums(abs(pMat)) >0]
+pMat <- pMat[keepGene,]
+
+geneOrder <- rownames(pMat)[hclust(dist(pMat), method = "ward.D2")$order]
+plotTab <- filter(plotTab, Gene %in% keepGene) %>%
+  mutate(Gene = factor(Gene, levels = rev(geneOrder)))
+
+pSumHeat <- ggplot(plotTab, aes(x=factor(conc), y = Gene, fill = pSign)) + geom_tile(size = 0.3, color = "white") + 
+  facet_wrap(~ peptide, nrow = 1, scales = "free_x") + 
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", midpoint = 0,
+                       name = bquote(-log[10]~"("~italic("P")~"Value)")) +
+  theme_full + theme(strip.text = element_text(face = "bold", size = 15),
+                     axis.text.y = element_text(size =14),
+                     axis.text.x = element_text(size=14, angle = 90, hjust = 1, vjust = 0.5)) +
+  ylab("Gene") + xlab("Concentration")
+pSumHeat
+ggsave("../figures/FigS4A_genePheatmapConc.pdf", height = 5, width = 12)
+```
+
+# Associations with pretreatment status
+Test for Genomics
+```{r}
+testTab <- dataBH3 %>% select(patID, feature, value) %>% left_join(patAnno, by ="patID") %>%
+  filter(!is.na(pretreat))
+resTab.pretreat <-  group_by(testTab, feature) %>% nest() %>%
+  mutate(m = map(data, ~t.test(value ~ pretreat,.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  select(feature, p.value, estimate) %>% ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = "BH"))
+resTab.pretreat
+```
+
+```{r pretreatBox, fig.width=10, fig.height=4}
+pscr <- filter(resTab.pretreat, p.value < 0.05) %>%
+  arrange(p.value) 
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature 
+  p <- pscr[i,]$p.value
+  plotTab <- filter(testTab, feature == featureName) %>%
+    filter(!is.na(pretreat))
+  
+  ggplot(plotTab, aes(x=pretreat, y = value, fill = pretreat)) + 
+    geom_boxplot(width=0.5) + 
+    ggbeeswarm::geom_beeswarm(aes(col = IGHV.status)) + 
+    scale_fill_manual(values= geneColor[c("yes","no")]) +
+    ylab("Cyt C release") + xlab("") +
+    scale_color_manual(values = c(M = "red",U="grey50"))+
+    ggtitle(sprintf("%s ~ %s (p=%s)", featureName, "pretreatment", 
+                    formatC(p, format = "e", digits = 2))) +
+    #geom_text(aes(label = gene),y = max(plotTab$value), stat = "count") +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5)) +
+    theme_full + xlab("Pretreated") +
+    theme(legend.position = "bottom")
+})
+cowplot::plot_grid(plotlist = plotList, ncol=2)
+```
+
+```{r}
+chisq.test(patAnno$IGHV.status, patAnno$pretreat)
+```
+
+# Estimate the confounding effect of pretreatment status
+
+How many treated and untreated samples?
+```{r}
+table(patAnno$pretreat)
+```
+
+## Adjust for pretreatment status
+
+Test for Genomics
+```{r}
+testTab <- dataBH3 %>% select(patID, feature, value) %>% full_join(geneTab, by = "patID") %>%
+  mutate(pretreat = patAnno[match(patID, patAnno$patID),]$pretreat) %>%
+  filter(!is.na(value), !is.na(status),!is.na(pretreat))
+resTab.gene.pre <-  group_by(testTab, feature, Gene) %>% nest() %>%
+  mutate(m = map(data, ~car::Anova(lm(value ~ pretreat + status,.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>% filter(term=="status") %>%
+  select(feature, Gene, p.value, statistic) 
+```
+
+Methylation cluster
+```{r}
+testTab <- dataBH3 %>%
+  mutate(MC = patMeta[match(patID, patMeta$Patient.ID),]$Methylation_Cluster,
+         pretreat = patAnno[match(patID, patAnno$patID),]$pretreat) %>%
+  filter(!is.na(MC), !is.na(pretreat))
+
+resTab.meth.pre <- group_by(testTab, feature) %>% nest() %>%
+  mutate(m = map(data, ~car::Anova(lm(value ~ pretreat + MC,.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  filter(term=="MC") %>%
+  mutate(Gene = "Methylation_Cluster") %>%
+  select(feature, Gene, p.value) 
+```
+
+Combine 
+```{r}
+resTab.pre <- bind_rows(resTab.gene.pre, resTab.meth.pre) %>%
+  ungroup() %>%
+  arrange(p.value) %>% select(feature, Gene, p.value) %>% dplyr::rename(p.block = p.value)
+```
+
+## Test only in untreated 
+
+Test for Genomics
+```{r}
+testTab <- dataBH3 %>% select(patID, feature, value) %>% full_join(geneTab, by = "patID") %>%
+  mutate(pretreat = patAnno[match(patID, patAnno$patID),]$pretreat) %>%
+  filter(!is.na(value), !is.na(status),pretreat == "no")
+
+resTab.gene.untr <-  group_by(testTab, feature, Gene) %>% nest() %>%
+  mutate(m = map(data, ~car::Anova(lm(value ~ status,.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>% filter(term=="status") %>%
+  select(feature, Gene, p.value, statistic) 
+```
+
+Methylation cluster
+```{r}
+testTab <- dataBH3 %>%
+  mutate(MC = patMeta[match(patID, patMeta$Patient.ID),]$Methylation_Cluster,
+         pretreat = patAnno[match(patID, patAnno$patID),]$pretreat) %>%
+  filter(!is.na(MC), pretreat == "no")
+
+resTab.meth.untr <- group_by(testTab, feature) %>% nest() %>%
+  mutate(m = map(data, ~car::Anova(lm(value ~MC,.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  filter(term=="MC") %>%
+  mutate(Gene = "Methylation_Cluster") %>%
+  select(feature, Gene, p.value) 
+```
+
+```{r}
+resTab.untr <- bind_rows(resTab.gene.untr, resTab.meth.untr) %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = "BH")) %>%
+  arrange(p.value) %>% select(feature, Gene, p.value) %>% dplyr::rename(p.untreat = p.value)
+
+```
+
+
+Table for comparing results
+```{r}
+compareTab <- left_join(resTab, resTab.pre) %>% left_join(resTab.untr) %>%
+  mutate(ifSig = p.adj < 0.2) %>%
+  mutate(pair = paste0(feature, "~", Gene))
+write_csv2(filter(compareTab, ifSig), "pretreatment_effect_estiamtion.csv")
+```
+
+```{r comparePretreat, fig.height=6, fig.width=12}
+pCut <- -log10(0.05)
+
+p1 <- ggplot(compareTab, aes(x=-log10(p.value), y = -log10(p.block))) +
+  geom_point(aes(col = ifSig),size=3) + 
+  geom_abline(slope = 1, intercept = 0, col= colList[1], linetype = "solid", alpha=0.5) +
+  geom_hline(yintercept = pCut, col = "grey50", linetype ="dashed") +
+  coord_cartesian(xlim = c(0,3),ylim=c(0,3)) +
+  scale_color_manual(values = c(`TRUE` = colList[2], `FALSE` = "grey50"), guide = FALSE) +
+  ggrepel::geom_text_repel(data = filter(compareTab,ifSig), aes(label = pair), size=4) +
+  xlab("-log10 (p-value)") + ylab("-log10 (p-value), adjusted for pretreamtent") +
+  theme_full + ggtitle("Adjust pretreatment effect using multivariate model")
+
+p2 <- ggplot(compareTab, aes(x=-log10(p.value), y = -log10(p.untreat))) +
+  geom_point(aes(col = ifSig), size=3) + 
+  geom_abline(slope = 1, intercept = 0, col= colList[1], linetype = "solid", alpha=0.5) +
+  geom_hline(yintercept = pCut, col = "grey50", linetype ="dashed") +
+  coord_cartesian(xlim = c(0,3),ylim=c(0,3)) +
+  scale_color_manual(values = c(`TRUE` = colList[2], `FALSE` = "grey50"), guide = FALSE) +
+  ggrepel::geom_text_repel(data = filter(compareTab,ifSig), aes(label = pair), size=4) +
+  xlab("-log10 (p-value)") + ylab("-log10 (p-value), untreated samples") +
+  theme_full + ggtitle("Test only in untreated samples")
+
+plot_grid(p1,p2)
+```
+
+
+# Association with transcriptomics
+
+## Preprocessing
+
+RNAseq
+```{r}
+load("../../var/ddsrna_180717.RData")
+
+#subset
+ddsSub <- dds[,dds$PatID %in% dataBH3$patID]
+
+#only keep protein coding genes with symbol
+ddsSub <- ddsSub[rowData(ddsSub)$biotype %in% "protein_coding" & !rowData(ddsSub)$symbol %in% c("",NA),]
+
+#remove lowly expressed genes
+ddsSub <- ddsSub[rowSums(counts(ddsSub, normalized = TRUE)) > 100,]
+
+#voom transformation
+exprMat <- limma::voom(counts(ddsSub), lib.size = ddsSub$sizeFactor)$E
+ddsSub.voom <- ddsSub
+assay(ddsSub.voom) <- exprMat
+
+#vst
+#ddsSub.voom <- varianceStabilizingTransformation(ddsSub)
+
+#count table for plotting
+countMat <- counts(ddsSub, normalized = TRUE)
+
+exprMat <- assay(ddsSub.voom)
+```
+
+BH3 profiling
+```{r}
+#Prepare BH3 data matrix
+dataMat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+dataMat <- dataMat[colnames(ddsSub.voom),]
+```
+
+## Association test for each feature
+
+```{r, warning=FALSE, message=FALSE}
+allRes <- lapply(colnames(dataMat), function(n) {
+  featureVec <- dataMat[,n]
+  testMat <- exprMat[,!is.na(featureVec)]
+  featureVec <- featureVec[!is.na(featureVec)]
+  
+  designMat <- model.matrix(~featureVec)
+  fit <- lmFit(testMat, designMat)
+  fit2 <- eBayes(fit)
+  res <- topTable(fit2, number = "all") %>% data.frame(stringsAsFactors = FALSE) %>%
+    rownames_to_column("id") %>% mutate(symbol = rowData(ddsSub[id,])$symbol, feature = n)
+}) %>% bind_rows() %>% arrange(P.Value) #%>%
+  #mutate(adj.P.Val = p.adjust(P.Value, method = "BH"))
+```
+
+### Number of significant associations per feature (10% FDR)
+```{r RNA_number_association, fig.height=4, fig.width=8}
+sumTab <- allRes %>% group_by(feature) %>%
+  summarise(n = sum(adj.P.Val < 0.1)) %>%
+  arrange(desc(n))
+
+plotTab <- sumTab %>% mutate(feature = factor(feature, levels = feature))
+
+ggplot(plotTab, aes(x=feature, y=n)) + geom_bar(stat = "identity") + theme_full +
+  theme(axis.text.x = element_text(angle = 90, hjust=1,vjust=0.5)) +
+  xlab("") + ylab("Number of \nsignificant associations\n(10% FDR)")
+sumTab
+ggsave("../figures/FigS5_RNA_num_associations.pdf", height = 4, width = 8)
+```
+
+### Table of significant associations
+```{r, fig.height=6, fig.width=10}
+allRes.sig <- filter(allRes, adj.P.Val < 0.1)
+allRes.sig %>% arrange(P.Value) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  select(feature, symbol, P.Value, t, adj.P.Val, logFC, id) %>%
+  DT::datatable()
+```
+
+
+## Heamap for significant correlations
+```{r RNAheatmap, fig.height=50, fig.width=15}
+heatList <- lapply(unique(allRes.sig$feature), function(n) {
+  subTab <- filter(allRes.sig, feature ==n) %>% arrange(desc(t))
+  ids <- subTab$id
+  symbol <- subTab$symbol
+  
+  #prepare annotation
+  colAnno <- patAnno %>% filter(patID %in% rownames(dataMat)) %>%
+    mutate(cytC_release = dataMat[patID,n]) %>% arrange(cytC_release) %>%
+    select(patID, IGHV.status, trisomy12, cytC_release) %>%
+    data.frame() %>% column_to_rownames("patID")
+  
+  exprSub <- exprMat[ids, rownames(dataMat)]
+  rownames(exprSub) <- symbol
+  exprSub <- exprSub[,rownames(colAnno)]
+  
+  exprSub <- mscale(exprSub, censor = 5)
+  pheatmap::pheatmap(exprSub, cluster_rows = FALSE, cluster_cols = FALSE, annotation_col = colAnno,main = n,
+                     annotation_colors = colorAnno,
+                     color = colorRampPalette(c(colList[2],"white",colList[1]))(100), silent = TRUE)$gtable
+})
+
+hRatio <- sumTab[match(unique(allRes.sig$feature), sumTab$feature),]$n +5
+plot_grid(plotlist = heatList, ncol=1, rel_heights = hRatio)
+```
+
+
+### Plot top 9 significant associations
+
+```{r rnaCorScatter, fig.height=14, fig.width=12}
+plotList <- lapply(seq(9),function(i) {
+  fe <- allRes[i,]$feature
+  gene <- allRes[i,]$id
+  name <- allRes[i,]$symbol
+  plotTab <- tibble(expr = countMat[gene,],val = dataMat[,fe], patID = colnames(countMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12))
+ 
+   ggplot(plotTab, aes(x=log2(expr), y=val)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    xlab("Log2 RNAseq counts") + ylab(fe) + ggtitle(name) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+plot_grid(plotlist = plotList, ncol=3)
+```
+
+
+### Plot top 9 significant associations for ABT199
+```{r rnaCorScatter_abt_pos, fig.height=14, fig.width=12}
+allRes.abt <- filter(allRes, feature == "ABT199", t>0)
+plotList <- lapply(seq(9),function(i) {
+  fe <- allRes.abt[i,]$feature
+  gene <- allRes.abt[i,]$id
+  name <- allRes.abt[i,]$symbol
+  plotTab <- tibble(expr = countMat[gene,],val = dataMat[,fe], patID = colnames(countMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12))
+ 
+   ggplot(plotTab, aes(x=log2(expr), y=val)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    xlab("Log2 RNAseq counts") + ylab(fe) + ggtitle(name) + 
+    theme_full + theme(legend.position ="bottom")
+})
+
+plot_grid(plotlist = plotList, ncol=3)
+```
+
+```{r rnaCorScatter_abt_neg, fig.height=14, fig.width=12}
+allRes.abt <- filter(allRes, feature == "ABT199", t<0)
+plotList <- lapply(seq(9),function(i) {
+  fe <- allRes.abt[i,]$feature
+  gene <- allRes.abt[i,]$id
+  name <- allRes.abt[i,]$symbol
+  plotTab <- tibble(expr = countMat[gene,],val = dataMat[,fe], patID = colnames(countMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12))
+ 
+   ggplot(plotTab, aes(x=log2(expr), y=val)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    xlab("Log2 RNAseq counts") + ylab(fe) + ggtitle(name) + 
+    theme_full + theme(legend.position ="bottom")
+})
+
+plot_grid(plotlist = plotList, ncol=3)
+```
+
+
+### Plot selected associations for ABT199
+```{r rnaCorScatter_sele, fig.height=6, fig.width=14}
+plotRes <- filter(allRes, symbol %in% c("PMAIP1","LAG3","COX5A", "BCL2L11"), feature == "ABT199")
+
+plotTab <- lapply(seq(nrow(plotRes)),function(i) {
+  fe <- plotRes[i,]$feature
+  gene <- plotRes[i,]$id
+  name <- plotRes[i,]$symbol
+  pVal <- formatC(plotRes[i,]$P.Value, digits=2, format="e")
+  
+  tibble(expr = countMat[gene,],val = dataMat[,fe], patID = colnames(countMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12),
+             p = pVal, geneName = name)
+ 
+
+}) %>% bind_rows()
+
+pABT <- ggplot(plotTab, aes(x=log2(expr), y=val)) + 
+  geom_point(aes(color = group, shape = group), size=3) + 
+   scale_color_manual(values = groupColor, name = "") +
+   scale_shape_manual(values = shapeAnno, name = "") + 
+  geom_smooth(method = "lm") +
+  xlab("Log2 RNAseq counts") + ylab("ABT199") + #ggtitle(bquote(atop(.(name),"("*italic("P")~"="~.(pVal)*")"))) + 
+  facet_wrap(~geneName+p,  scales = "free_x", ncol = 4,
+           labeller = label_bquote(atop(.(geneName),"("*italic("P")~"="~.(p)*")"))) +
+  theme_full +
+  theme(strip.background = element_rect(fill = NA, size = 1.5),
+        strip.text = element_text(size=15, face = "bold"),
+        legend.position ="bottom", axis.title.y = element_text(size=18, face="bold"))
+
+#plot_grid(plotlist = plotList, ncol=4)
+```
+
+### Plot selected associations for BAD
+```{r rnaCorScatter_sele_BAD, fig.height=12, fig.width=12}
+plotRes <- filter(allRes, symbol %in% c("PMAIP1","LAG3","COX5A", "BCL2L11"), feature == "BAD")
+
+plotTab <- lapply(seq(nrow(plotRes)),function(i) {
+  fe <- plotRes[i,]$feature
+  gene <- plotRes[i,]$id
+  name <- plotRes[i,]$symbol
+  pVal <- formatC(plotRes[i,]$P.Value, digits=2, format="e")
+  
+  tibble(expr = countMat[gene,],val = dataMat[,fe], patID = colnames(countMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+      mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+             tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+      mutate(group = paste0(IGHV, tri12),
+             p = pVal, geneName = name)
+ 
+
+}) %>% bind_rows()
+
+pBAD <- ggplot(plotTab, aes(x=log2(expr), y=val)) + 
+  geom_point(aes(color = group, shape = group), size=3) + 
+   scale_color_manual(values = groupColor, name = "") +
+   scale_shape_manual(values = shapeAnno, name = "") + 
+  geom_smooth(method = "lm") +
+  xlab("Log2 RNAseq counts") + ylab("BAD") + #ggtitle(bquote(atop(.(name),"("*italic("P")~"="~.(pVal)*")"))) + 
+  facet_wrap(~geneName+p,  scales = "free_x", ncol = 4,
+           labeller = label_bquote(atop(.(geneName),"("*italic("P")~"="~.(p)*")"))) +
+  theme_full +
+  theme(strip.background = element_rect(fill = NA, size = 1.5),
+        strip.text = element_text(size=15, face = "bold"),
+        legend.position ="bottom", axis.title.y = element_text(size=18, face="bold"), legend.text = element_text(size=16))
+```
+
+Combine plot for ABT199 and BAD
+```{r, fig.height=10, fig.width=16}
+plot_grid(pABT + theme(legend.position = "none",
+                       axis.title.x = element_blank()), 
+          NULL,
+          pBAD, 
+          ncol=1, rel_heights = c(1,0.1,1.2),
+          align = "v")
+ggsave("../figures/Fig3A_CorPlot.pdf", height = 10, width = 16)
+```
+
+## Pathway enrichment analysis for features that associate with gene expression
+
+### Cancer Hallmark
+```{r, message=FALSE}
+gmts <- list(H = "../data/commonFiles/h.all.v6.2.symbols.gmt",
+             KEGG = "../data/commonFiles/c2.cp.kegg.v5.1.symbols.gmt")
+feList <- arrange(sumTab, desc(n)) %>% filter(n>0) %>% pull(feature)
+enRes <- lapply(feList, function(n) {
+  featureVec <- dataMat[,n]
+  testMat <- exprMat[,!is.na(featureVec)]
+  featureVec <- featureVec[!is.na(featureVec)]
+  
+  designMat <- model.matrix(~featureVec)
+  runCamera(testMat, designMat, gmts$H, id = rowData(ddsSub[rownames(testMat),])$symbol,
+            removePrefix = "HALLMARK_", pCut = 0.01, ifFDR = TRUE,plotTitle = n)
+})
+names(enRes) <- feList
+```
+
+```{r HallmarkEnrich, fig.width=8, fig.height=4}
+pList <- lapply(enRes, function(n) n$enrichPlot)
+plot_grid(plotlist = pList, ncol=1, rel_heights = c(2,3,3), align = "hv")
+ggsave("../figures/Fig3B_HallmarkEnrich.pdf", width = 8, height = 4)
+```
+
+### KEGG
+```{r KEGGenrich, message=FALSE}
+feList <- arrange(sumTab, desc(n)) %>% filter(n>0) %>% pull(feature)
+enRes <- lapply(feList, function(n) {
+  featureVec <- dataMat[,n]
+  testMat <- exprMat[,!is.na(featureVec)]
+  featureVec <- featureVec[!is.na(featureVec)]
+  
+  designMat <- model.matrix(~featureVec)
+  runCamera(testMat, designMat, gmts$KEGG, id = rowData(ddsSub[rownames(testMat),])$symbol,
+            removePrefix = "KEGG_", pCut = 0.1, ifFDR = TRUE,plotTitle = n)
+})
+names(enRes) <- feList
+```
+
+```{r, fig.width=15, fig.height=15}
+pList <- lapply(enRes, function(n) n$enrichPlot)
+plot_grid(plotlist = pList, ncol=1, rel_heights = c(2,2,0.7), align = "hv")
+```
+
+Record siginificant RNAs for later feature selection
+```{r}
+rnaCorList <- filter(allRes, P.Value < 0.01)
+```
+
+
+### Gene set heatmap
+
+```{r}
+#function to plot heatmap for each gene set
+plotSetHeatmap <- function(geneSigTab, setDir, setName, exprMat, colAnno, scale = TRUE, rowAnno = NULL, annoCol = NULL) {
+  geneList <- piano::loadGSC(setDir)[["gsc"]][[setName]]
+  sigGene <- dplyr::filter(geneSigTab, symbol %in% geneList) %>%
+    arrange(desc(logFC))
+  colAnno <- colAnno[order(colAnno[,1]),,drop = FALSE]
+  plotMat <- exprMat[sigGene[["id"]],rownames(colAnno)]
+  rownames(plotMat) <- sigGene[["symbol"]]
+
+  if (scale) {
+    #calculate z-score and sensor
+    plotMat <- t(scale(t(plotMat)))
+    plotMat[plotMat >= 4] <- 4
+    plotMat[plotMat <= -4] <- -4
+  }
+
+  pheatmap(plotMat, color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+           cluster_cols = FALSE, cluster_rows = FALSE,
+           annotation_col = colAnno, 
+           show_colnames = FALSE, fontsize_row = 10, breaks = seq(-5,5, length.out = 101), treeheight_row = 0,
+           border_color = NA, main = setName)
+
+}
+```
+
+
+```{r NFKB_geneExpression,fig.height=4, fig.width=8}
+plotRes <- filter(allRes, feature == "ABT199", P.Value < 0.01)
+colAnno <- data.frame(dataMat)[,"ABT199", drop=FALSE]
+pdf("../figures/Fig3C_NFKB_heatmap.pdf", height = 4, width = 7)
+plotSetHeatmap(plotRes, gmts$H, "HALLMARK_TNFA_SIGNALING_VIA_NFKB",exprMat = exprMat, colAnno = colAnno)
+dev.off()
+```
+
+# Association with proteomics
+
+## Preprocessing
+
+Proteomics
+```{r}
+load("../../var/proteomic_LUMOS_batch13.RData")
+
+#subset
+protSub <- protCLL[,colnames(protCLL) %in% dataBH3$patID]
+
+exprMat <- assays(protSub)[["log2Norm"]]
+
+#remove invariate proteins
+#sds <- genefilter::rowSds(exprMat, na.rm= TRUE)
+#exprMat <- exprMat[sds > genefilter::shorth(sds),]
+
+dim(exprMat)
+
+
+```
+
+BH3 profiling
+```{r}
+#Prepare BH3 data matrix
+dataMat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+dataMat <- dataMat[colnames(exprMat),]
+```
+
+## Association test for each feature
+
+```{r, warning=FALSE, message=FALSE}
+allRes <- lapply(colnames(dataMat), function(n) {
+  featureVec <- dataMat[,n]
+  testMat <- exprMat[,!is.na(featureVec)]
+  featureVec <- featureVec[!is.na(featureVec)]
+  batch <- protSub[,names(featureVec)]$batch
+  
+  designMat <- model.matrix(~featureVec+batch)
+  fit <- lmFit(testMat, designMat)
+  fit2 <- eBayes(fit)
+  res <- topTable(fit2, number = "all", coef = "featureVec") %>% 
+    data.frame(stringsAsFactors = FALSE) %>%
+    rownames_to_column("id") %>% mutate(symbol = rowData(protSub[id,])$hgnc_symbol, feature = n)
+}) %>% bind_rows() %>% arrange(P.Value)
+
+```
+
+### Number of significant associations per feature (10% FDR)
+```{r, fig.height=6, fig.width=10}
+sumTab <- allRes %>% group_by(feature) %>%
+  summarise(n = sum(P.Value < 0.01)) %>%
+  arrange(desc(n))
+
+plotTab <- sumTab %>% mutate(feature = factor(feature, levels = feature))
+
+ggplot(plotTab, aes(x=feature, y=n)) + geom_bar(stat = "identity") + theme_full +
+  theme(axis.text.x = element_text(angle = 90, hjust=1,vjust=0.5))
+```
+**None passed 10% FDR**
+
+### Table of significant associations (P<0.01)
+```{r, fig.height=6, fig.width=10}
+allRes.sig <- filter(allRes, P.Value < 0.1)
+allRes.sig %>% arrange(P.Value) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  select(feature, symbol, P.Value, adj.P.Val, logFC, id) %>%
+  DT::datatable()
+```
+
+### Plot top 9 associations
+```{r corProteinScatter, fig.height=14, fig.width=12}
+plotList <- lapply(seq(9),function(i) {
+  fe <- allRes[i,]$feature
+  gene <- allRes[i,]$id
+  name <- allRes[i,]$symbol
+  plotTab <-  tibble(expr = exprMat[gene,],val = dataMat[,fe], patID = colnames(exprMat)) %>%
+    left_join(patAnno,by="patID") %>% filter(!is.na(trisomy12), !is.na(IGHV.status)) %>%
+        mutate(IGHV = ifelse(IGHV.status == "M","M-CLL,", "U-CLL,"),
+               tri12 = ifelse(trisomy12 == "tri12"," tri12"," no tri12")) %>%
+        mutate(group = paste0(IGHV, tri12))
+ 
+   
+  ggplot(plotTab, aes(x=expr, y=val)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    xlab("Protein expression") + ylab(sprintf("%s\n(Cyt C release)",fe)) + ggtitle(name) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+plot_grid(plotlist = plotList, ncol=3)
+```
+
+
+
+
+# Association with the spontaneous apoptosis of CLL cells
+
+
+## Measured by image data
+
+### PCs
+```{r}
+load("../../var/DMSO_Viabilities_Monoculture.RData")
+overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
+
+pcTab <-  pcRes$x[,1:2] %>% data.frame() %>%
+  rownames_to_column("patID") %>%
+  pivot_longer(-patID, names_to = "feature", values_to = "value")
+
+dataMat <- pcTab %>%
+  filter(patID %in% overSample) %>%
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+viabImg <- DMSO_viabilties[match(overSample, DMSO_viabilties$NCT__Pat_ID),]
+
+corRes <- apply(dataMat, 2, function(x) {
+  res <- cor.test(x,viabImg$Absolute_viability_CLL)
+  data.frame(P.Value = res$p.value, coef = res$estimate)
+}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
+  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+```
+
+
+```{r corPCviabImg, fig.width=10, fig.height=5}
+pscr <- corRes
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  p <- pscr[i,]$P.Value
+  plotTab <- filter(pcTab, feature == featureName) %>%
+    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
+           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
+    filter(!is.na(viab)) %>%
+    mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
+           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
+    mutate(group = paste0(IGHV, tri12))
+  
+  ggplot(plotTab, aes(x=viab, y = value)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    ylab(featureName) + xlab("Percent live cells") +
+    ggtitle(paste0(featureName," ~ Viability")) +
+    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+pLegend <- get_legend(plotList[[1]]+theme(legend.text = element_text(size=14)))
+plot_grid(plot_grid(plotList[[1]] + theme(legend.position = "none"), 
+          plotList[[2]] + theme(legend.position = "none"), ncol=2),
+          pLegend, ncol=1, rel_heights = c(1,0.1))
+ggsave("../figures/Fig1F_corPCviabImg.pdf", width = 10, height = 5)
+```
+
+### Individual peptide
+
+```{r, echo=FALSE}
+#correlation with viability data obtained by image analysis, no significant correlations
+overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
+dataMat <- dataBH3 %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+viabImg <- DMSO_viabilties[match(overSample, DMSO_viabilties$NCT__Pat_ID),]
+
+corRes <- apply(dataMat, 2, function(x) {
+  res <- cor.test(x,viabImg$Absolute_viability_CLL)
+  data.frame(P.Value = res$p.value, coef = res$estimate)
+}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
+  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+```
+
+If multiple concentrations are identified as significant, only show the most significant concentration.
+```{r corViabImg, fig.width=14, fig.height=10, echo=FALSE, warning=FALSE}
+pscr <- filter(corRes, adj.P.Val < 0.10) %>%
+  arrange(P.Value) %>% distinct(peptide, .keep_all = TRUE)
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  p <- pscr[i,]$P.Value
+  plotTab <- filter(dataBH3, feature == featureName) %>%
+    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
+           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
+    filter(!is.na(viab)) %>% mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
+           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
+    mutate(group = paste0(IGHV, tri12))
+  
+  ggplot(plotTab, aes(x=viab, y = value)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    ylab(featureName) + xlab("Percent live cells") +
+    ggtitle(paste0(featureName," ~ Viability")) +
+    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+cowplot::plot_grid(plotlist = plotList, ncol=3)
+```
+
+
+## Association with basline Annexin data
+```{r}
+load("../output/dataAnnexin.RData")
+baseTab <- filter(dataAnnexin, drug =="DMSO",conc == 0) %>%
+  group_by(patID) %>% summarise(viab = mean(Viability))
+
+overSample <- intersect(dataBH3$patID, baseTab$patID)
+
+dataMat <- dataBH3 %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+dataMat <- dataMat[overSample,]
+viabAnn <- baseTab[match(overSample, baseTab$patID),]$viab
+
+corRes <- apply(dataMat, 2, function(x) {
+  res <- cor.test(x,viabAnn)
+  data.frame(P.Value = res$p.value, coef = res$estimate)
+}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
+  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+corRes
+```
+No significant correlations?
+
+```{r corViabAnn, fig.width=14, fig.height=15, echo=FALSE, warning=FALSE}
+pscr <- corRes
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  p <- pscr[i,]$P.Value
+  plotTab <- filter(dataBH3, feature == featureName) %>%
+    mutate(viab = baseTab[match(patID, baseTab$patID),]$viab,
+           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
+    filter(!is.na(viab))
+  ggplot(plotTab, aes(x=viab, y = value)) + 
+    geom_point(aes(shape = IGHV, col = trisomy12),size=3) + geom_smooth(method = "lm") +
+    ylab("Cyt C release") + xlab("Percent live cells") +
+    scale_shape_manual(values = c(M=20, U=1)) +
+    ggtitle(featureName) +
+    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
+    scale_color_manual(values = geneColor[c("tri12","WT")]) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+cowplot::plot_grid(plotlist = plotList, ncol=3)
+```
+
+
+# Multivariate feature selection for explaining BH3 profling in CLL
+
+## Data pre-processing
+
+BH3 profiling
+```{r}
+#Prepare BH3 data matrix
+bh3Mat <- dataBH3 %>% 
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+```
+
+RNAseq
+```{r}
+exprMat <- assay(ddsSub.voom)
+exprMat <- exprMat[rownames(exprMat) %in% rnaCorList$id,]
+rownames(exprMat) <- rowData(ddsSub.voom[rownames(exprMat),])$symbol
+exprMat <- t(exprMat)
+```
+
+For genomic data
+```{r}
+mMap <- c(HP=2,IP=1,LP=0)
+#Prepare genomic background
+genData <- patMeta[,c(1,9: ncol(patMeta))] %>% 
+  filter(Patient.ID %in% dataBH3$patID) %>%
+  mutate_all(as.character) %>%
+  mutate(IGHV.status = ifelse(!is.na(IGHV.status),ifelse(IGHV.status == "M",1,0),NA)) %>%
+  mutate(MClust = mMap[Methylation_Cluster]) %>%
+  mutate_at(vars(-Patient.ID), as.integer) %>%
+  data.frame() %>% column_to_rownames("Patient.ID")
+
+#remove gene with higher than 20% missing values
+genData <- genData[,colSums(is.na(genData))/nrow(genData) <= 0.2]
+
+#occurrence > 5
+genData <- genData[,colSums(genData,na.rm=TRUE) >5]
+
+#fill the missing value with majority
+genData <- apply(genData, 2, function(x) {
+  xVec <- x
+  mostFreq <- names(sort(table(xVec),decreasing = TRUE))[1]
+  xVec[is.na(xVec)] <- as.numeric(mostFreq)
+  xVec
+})
+```
+
+For demographic and clinical data
+```{r}
+demoData <- distinct(dataBH3, patID, sampleID) %>%
+  left_join(patMeta, by = c(patID = "Patient.ID")) %>%
+  mutate(pretreat = treatmentTab[match(sampleID, treatmentTab$sampleID),]$pretreat,
+         age=ageTab[match(sampleID, ageTab$sampleID),]$age) %>%
+  select(patID, gender, age, pretreat) %>%
+  mutate(age = replace_na(age, mean(age,na.rm=T)),
+         pretreat = replace_na(pretreat,0)) %>%
+  mutate_at(vars(-patID),as.numeric) %>%
+  dplyr::rename(sex=gender, con.age = age) %>%
+  mutate(sex = sex-1, con.age = con.age/10) %>%
+  data.frame() %>% column_to_rownames("patID")
+```
+
+Function to Generate the explanatory dataset for each BH3 profile
+```{r explain dataset for seahorse}
+#function to generate response vector and explainatory variable for each seahorse measurement
+generateData <- function(inclSet, rnaList = NULL, onlyCombine = FALSE, censor = NULL, robust = FALSE) {
+    
+    dataScale <- function(x, censor = NULL, robust = FALSE) {
+        #function to scale different variables
+        if (length(unique(na.omit(x))) == 2){
+          #a binary variable, change to -0.5 and 0.5 for 1 and 2
+          x - 0.5
+        } else if (length(unique(na.omit(x))) == 3) {
+          #catagorical varialbe with 3 levels, methylation_cluster, change to -0.5,0,0.5
+          (x - 1)/2
+        } else {
+          if (robust) {
+          #continuous variable, centered by median and divied by 2*mad
+          mScore <- (x-median(x,na.rm=TRUE))/mad(x,na.rm=TRUE)
+            if (!is.null(censor)) {
+              mScore[mScore > censor] <- censor
+              mScore[mScore < -censor] <- -censor
+            }
+          mScore/2
+          } else {
+            mScore <- (x-mean(x,na.rm=TRUE))/(sd(x,na.rm=TRUE))
+              if (!is.null(censor)) {
+                mScore[mScore > censor] <- censor
+                mScore[mScore < -censor] <- -censor
+              }
+          mScore/2
+          }
+        }
+      }
+    
+    
+    allResponse <- list()
+    allExplain <- list()
+
+    for (measure in colnames(inclSet$BH3)) {
+      y <- inclSet$BH3[,measure]
+      y <- y[!is.na(y)]
+      
+      #get overlapped samples for each dataset 
+      overSample <- names(y)
+      
+      for (eachSet in inclSet) {
+        overSample <- intersect(overSample,rownames(eachSet))
+      }
+      
+      y <- dataScale(y[overSample], censor = censor, robust = robust)
+      
+      #generate explainatory variable table for each seahorse measurement
+      expTab <- list()
+      
+      if ("gen" %in% names(inclSet)) {
+        geneTab <- inclSet$gen[overSample,]
+        #at least 3 mutated sample
+        geneTab <- geneTab[, colSums(geneTab) >= 3]
+        vecName <- sprintf("genetic(%s)", ncol(geneTab))
+        expTab[[vecName]] <- apply(geneTab,2,dataScale)
+      }
+      
+      
+      if ("RNA" %in% names(inclSet)){
+        
+        rnaMat <- inclSet$RNA[overSample, ]
+        
+        #print(rnaList[[measure]])
+        #for expression
+        if(!is.null(rnaList)) {
+          rnaMat <- rnaMat[,rnaList[[measure]]]
+          #print(rnaMat)
+        }
+        colnames(rnaMat) <- paste0("con.",colnames(rnaMat), sep = "")
+        vecName <- sprintf("RNA(%s)", ncol(rnaMat))
+        expTab[[vecName]] <- apply(rnaMat,2,dataScale, censor = censor, robust = robust)
+        
+      }
+        
+      
+      if ("demographics" %in% names(inclSet)){
+        demoTab <- inclSet$demographics[overSample,]
+        vecName <- sprintf("demographics(%s)", ncol(demoTab))
+        expTab[[vecName]] <- apply(demoTab,2,dataScale)
+      }
+      
+      
+      comboTab <- c()
+      for (eachSet in names(expTab)){
+        comboTab <- cbind(comboTab, expTab[[eachSet]])
+      }
+      vecName <- sprintf("all(%s)", ncol(comboTab))
+      expTab[[vecName]] <- comboTab
+      
+      allResponse[[measure]] <- y
+      allExplain[[measure]] <- expTab
+    }
+  if (onlyCombine) {
+    #only return combined results, for feature selection
+    allExplain <- lapply(allExplain, function(x) x[length(x)])
+  }
+    
+  return(list(allResponse=allResponse, allExplain=allExplain))
+
+}
+```
+
+
+Clean and integrate multi-omics data
+```{r}
+rnaList <- lapply(unique(rnaCorList$feature), function(x) filter(rnaCorList, feature == x)$symbol)
+names(rnaList) <- unique(rnaCorList$feature)
+
+inclSet<-list(gen=genData, 
+            demographics=demoData,  BH3 = bh3Mat)
+cleanData <- generateData(inclSet, censor = 5, rnaList = rnaList)
+```
+
+## Perform multi-variate regression
+
+### LASSO model 
+
+#### Training models
+
+Function for multi-variate regression
+```{r}
+runGlm <- function(X, y, method = "ridge", repeats=20, folds = 3) {
+  modelList <- list()
+  lambdaList <- c()
+  varExplain <- c()
+  coefMat <- matrix(NA, ncol(X), repeats)
+  rownames(coefMat) <- colnames(X)
+
+  if (method == "lasso"){
+    alpha = 1
+  } else if (method == "ridge") {
+    alpha = 0
+  }
+  
+  for (i in seq(repeats)) {
+    if (ncol(X) > 2) {
+      res <- cv.glmnet(X,y, type.measure = "mse", family="gaussian", 
+                       nfolds = folds, alpha = alpha, standardize = FALSE)
+      lambdaList <- c(lambdaList, res$lambda.min)
+      modelList[[i]] <- res
+      
+      coefModel <- coef(res, s = "lambda.min")[-1] #remove intercept row
+      coefMat[,i] <- coefModel
+      
+      #calculate variance explained
+      y.pred <- predict(res, s = "lambda.min", newx = X)
+      varExp <- cor(as.vector(y),as.vector(y.pred))^2
+      varExplain[i] <- ifelse(is.na(varExp), 0, varExp) 
+      
+    } else {
+      fitlm<-lm(y~., data.frame(X))
+      varExp <- summary(fitlm)$r.squared
+      varExplain <- c(varExplain, varExp)
+      
+    }
+
+  }
+  list(modelList = modelList, lambdaList = lambdaList, varExplain = varExplain, coefMat = coefMat)
+}
+```
+
+Perform lasso regression
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+library(glmnet)
+lassoResults <- list()
+for (eachMeasure in names(cleanData$allResponse)) {
+  dataResult <- list()
+  for (eachDataset in names(cleanData$allExplain[[eachMeasure]])) {
+    y <- cleanData$allResponse[[eachMeasure]]
+    X <- cleanData$allExplain[[eachMeasure]][[eachDataset]]
+  
+   
+    glmRes <- runGlm(X, y, method = "lasso", repeats = 50, folds = 3)
+    dataResult[[eachDataset]] <- glmRes 
+  }
+  lassoResults[[eachMeasure]] <- dataResult
+  
+}
+```
+
+
+
+
+#### Ploting R2
+
+Function for plotting variance explained for each measurement
+```{r varExpLASSO, fig.height=15, fig.width=20, echo=F, warning=FALSE, message=FALSE}
+plotVar <- function(glmResult) {
+  
+  pList <- lapply(names(glmResult), function(n) {
+     plotTab <- lapply(names(glmResult[[n]]), function(x) {
+       tibble(variable = x, value = glmResult[[n]][[x]]$varExplain)}) %>% 
+       bind_rows() %>% group_by(variable) %>% 
+       summarise(mean=mean(value, na.rm = TRUE),sd=sd(value, na.rm=TRUE))
+     
+     ggplot(plotTab,aes(x=variable, y=mean, fill= variable)) + 
+       geom_bar(position=position_dodge(), stat="identity", width = 0.8, col="black") + 
+       geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd, width = 0.3), position=position_dodge(.9)) + 
+       theme_classic() + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size =12), 
+                            plot.title = element_text(hjust =0.5),
+                            axis.text.y = element_text(size=12),
+                            axis.title = element_text(size=15),
+                            legend.position = "none") + 
+       scale_fill_brewer("Set1",type = "qual") + coord_cartesian(ylim = c(0,1)) +
+       ylab("R2") + xlab("") + ggtitle(paste0("Variance explained for ",n))
+  })
+  pList
+}
+
+varList <- plotVar(lassoResults)
+
+cowplot::plot_grid(plotlist = varList, ncol=3)
+```
+
+
+#### Ploting heatmap of selected features
+
+Function for the heatmap plot
+```{r}
+library(gtable)
+lassoPlot <- function(lassoOut, cleanData, freqCut = 1, coefCut = 0.01, setNumber = "last") {
+  plotList <- list()
+  if (setNumber == "last") {
+    setNumber <- length(lassoOut[[1]])
+  } else {
+    setNumber <- setNumber
+  }
+  for (seaName in names(lassoOut)) {
+    #for the barplot on the left of the heatmap
+    barValue <- rowMeans(lassoOut[[seaName]][[setNumber]]$coefMat)
+    freqValue <- rowMeans(abs(sign(lassoOut[[seaName]][[setNumber]]$coefMat)))
+    barValue <- barValue[abs(barValue) >= coefCut & freqValue >= freqCut] # a certain threshold
+    barValue <- barValue[order(barValue)]
+    if(length(barValue) == 0) {
+      plotList[[seaName]] <- NA
+      next
+    }
+
+    #for the heatmap and scatter plot below the heatmap
+    allData <- cleanData$allExplain[[seaName]][[setNumber]]
+    seaValue <- cleanData$allResponse[[seaName]]*2 #back to Z-score
+    
+    tabValue <- allData[, names(barValue),drop=FALSE]
+    ord <- order(seaValue)
+    seaValue <- seaValue[ord]
+    tabValue <- tabValue[ord, ,drop=FALSE]
+    sampleIDs <- rownames(tabValue)
+    tabValue <- as.tibble(tabValue)
+    
+    #change scaled binary back to catagorical
+    for (eachCol in colnames(tabValue)) {
+      if (strsplit(eachCol, split = "[.]")[[1]][1] != "con") {
+        tabValue[[eachCol]] <- as.integer(as.factor(tabValue[[eachCol]]))
+      }
+      else {
+        tabValue[[eachCol]] <- tabValue[[eachCol]]*2 #back to Z-score
+      }
+    }
+    
+    tabValue$Sample <- sampleIDs
+    #Mark different rows for different scaling in heatmap
+    matValue <- gather(tabValue, key = "Var",value = "Value", -Sample)
+    matValue$Type <- "mut"
+    
+    #For continuious value
+    matValue$Type[grep("con.",matValue$Var)] <- "con"
+    
+    #for methylation_cluster
+    matValue$Type[grep("ConsCluster",matValue$Var)] <- "meth"
+    
+    #change the scale of the value, let them do not overlap with each other
+    matValue[matValue$Type == "mut",]$Value = matValue[matValue$Type == "mut",]$Value + 10
+    matValue[matValue$Type == "meth",]$Value = matValue[matValue$Type == "meth",]$Value + 20
+    
+    
+    #color scale for viability
+    idx <- matValue$Type == "con"
+    
+    myCol <- colorRampPalette(c('dark red','white','dark blue'), 
+                   space = "Lab")
+    if (sum(idx) != 0) {
+      matValue[idx,]$Value = round(matValue[idx,]$Value,digits = 2)
+      minViab <- min(matValue[idx,]$Value)
+      maxViab <- max(matValue[idx,]$Value)
+      limViab <- max(c(abs(minViab), abs(maxViab)))
+      scaleSeq1 <- round(seq(-limViab, limViab,0.01), digits=2)
+      color4viab <- setNames(myCol(length(scaleSeq1+1)), nm=scaleSeq1)
+    } else {
+      scaleSeq1 <- round(seq(0,1,0.01), digits=2)
+      color4viab <- setNames(myCol(length(scaleSeq1+1)), nm=scaleSeq1)
+    }
+    
+
+    
+    #change continues measurement to discrete measurement
+    matValue$Value <- factor(matValue$Value,levels = sort(unique(matValue$Value)))
+    
+    #change order of heatmap
+    names(barValue) <-  gsub("con.", "", names(barValue))
+    matValue$Var <- gsub("con.","",matValue$Var)
+    matValue$Var <- factor(matValue$Var, levels = names(barValue))
+    matValue$Sample <- factor(matValue$Sample, levels = names(seaValue))
+    #plot the heatmap
+    p1 <- ggplot(matValue, aes(x=Sample, y=Var)) + geom_tile(aes(fill=Value), color = "gray") + 
+      theme_bw() + scale_y_discrete(expand=c(0,0)) + theme(axis.text.y=element_text(hjust=0, size=12), axis.text.x=element_blank(), axis.ticks=element_blank(), panel.border=element_rect(colour="gainsboro"),  plot.title=element_text(size=14, face = "bold"), panel.background=element_blank(), panel.grid.major=element_blank(), panel.grid.minor=element_blank()) + xlab("patients") + ylab("") + scale_fill_manual(name="Mutated", values=c(color4viab, `11`="gray96", `12`='black', `21`='lightgreen', `22`='green',`23` = 'green4'),guide=FALSE) + ggtitle(seaName)
+    
+    #Plot the bar plot on the left of the heatmap
+    barDF = data.frame(barValue, nm=factor(names(barValue),levels=names(barValue)))
+    
+    p2 <- ggplot(data=barDF, aes(x=nm, y=barValue)) + 
+      geom_bar(stat="identity", fill="lightblue", colour="black", position = "identity", width=.66, size=0.2) + 
+      theme_bw() + geom_hline(yintercept=0, size=0.3) + scale_x_discrete(expand=c(0,0.5)) + 
+      scale_y_continuous(expand=c(0,0)) + coord_flip() + 
+      theme(panel.grid.major=element_blank(), panel.background=element_blank(), axis.ticks.y = element_blank(),
+            panel.grid.minor = element_blank(), axis.text=element_text(size=12), panel.border=element_blank()) +
+      xlab("") + ylab("") + geom_vline(xintercept=c(0.5), color="black", size=0.6)
+    
+    #Plot the scatter plot under the heatmap
+    
+    # scatterplot below
+    scatterDF = data.frame(X=factor(names(seaValue), levels=names(seaValue)), Y=seaValue)
+    
+    p3 <- ggplot(scatterDF, aes(x=X, y=Y)) + geom_point(shape=21, fill="dimgrey", colour="black", size=1.2) + theme_bw() + theme(panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(), axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_text(size=12), panel.border=element_rect(colour="dimgrey", size=0.1), panel.background=element_rect(fill="gray96"))
+    
+    #Scale bar for continuous variable
+
+    Vgg = ggplot(data=data.frame(x=1, y=as.numeric(names(color4viab))), aes(x=x, y=y, color=y)) + geom_point() + 
+      scale_color_gradientn(name="Z-score", colours =color4viab) + theme(legend.title=element_text(size=12), legend.text=element_text(size=10))
+    
+    #Assemble all the plots togehter
+
+    # construct the gtable
+    wdths = c(1.5, 0.2, 1.3*ncol(matValue),0.8, 0.5)
+    hghts = c(0.1, 0.0022*nrow(matValue), 0.20, 0.7)
+    gt = gtable(widths=unit(wdths, "in"), heights=unit(hghts, "in"))
+    
+    ## make grobs
+    gg1 = ggplotGrob(p1)
+    gg2 = ggplotGrob(p2)
+    gg3 = ggplotGrob(p3)
+    gg4 = ggplotGrob(Vgg)
+    
+    ## fill in the gtable
+    gt = gtable_add_grob(gt, gtable_filter(gg2, "panel"), 2, 1) # add barplot
+    gt = gtable_add_grob(gt, gtable_filter(gg1, "panel"), 2, 3) # add heatmap
+    gt = gtable_add_grob(gt, gtable_filter(gg1, "title"), 1, 3) #add title to plot
+    gt = gtable_add_grob(gt, gtable_filter(gg3, "panel"), 4, 3) # add scatterplot
+    gt = gtable_add_grob(gt, gtable_filter(gg2, "axis-b"), 3, 1) # y axis for barplot
+    gt = gtable_add_grob(gt, gtable_filter(gg3, "axis-l"), 4, 2) # y axis for scatter plot
+    gt = gtable_add_grob(gt, gtable_filter(gg1, "axis-l"), 2, 4) # variable names
+    #gt = gtable_add_grob(gt, gtable_filter(gg4, "guide-box"), 2, 5) # scale bar for continous variables
+
+    
+    #plot
+    #grid.draw(gt)
+    plotList[[seaName]] <- gt
+  }
+  return(plotList)
+}
+```
+
+Plot all heatmaps
+```{r}
+heatMaps <- lassoPlot(lassoResults, cleanData, freqCut = 0.8)
+```
+
+```{r heatmapLASSO, fig.height=10, fig.width=10}
+heatMaps <- heatMaps[!is.na(heatMaps)]
+plot_grid(plotlist=heatMaps, ncol=1)
+```
+
+
+### Multivariate linear regression without LASSO penalty
+
+#### Training model
+
+Function for multi-variate regression without lasso penalty
+```{r }
+runLm <- function(X, y, repeats=20) {
+  modelList <- list()
+  varExplain <- c()
+  coefMat <- matrix(NA, ncol(X), repeats)
+  rownames(coefMat) <- colnames(X)
+  
+  for (i in seq(repeats)) {
+    res <- summary(lm(y~., data.frame(X)))
+    modelList[[i]] <- res
+    coefModel <- res$coefficients[-1,]
+    coefMat[,i] <- sign(coefModel[,1]) * (-log10(coefModel[,4]))
+    varExp <- res$adj.r.squared
+    varExplain <- c(varExplain, varExp)
+  }
+  list(modelList = modelList, varExplain = varExplain, coefMat = coefMat)
+}
+```
+
+Perform linear regression without penalization
+```{r, cache=TRUE, warning=FALSE, message=FALSE}
+lmResults <- list()
+for (eachMeasure in names(cleanData$allResponse)) {
+  dataResult <- list()
+  for (eachDataset in names(cleanData$allExplain[[eachMeasure]])) {
+    y <- cleanData$allResponse[[eachMeasure]]
+    X <- cleanData$allExplain[[eachMeasure]][[eachDataset]]
+  
+   
+    glmRes <- runLm(X, y, repeats = 3)
+    dataResult[[eachDataset]] <- glmRes 
+  }
+  lmResults[[eachMeasure]] <- dataResult
+  
+}
+```
+
+
+#### Ploting R2
+
+```{r varExpLM, fig.height=15, fig.width=20, echo=F, warning=FALSE, message=FALSE}
+varList <- plotVar(lmResults)
+
+cowplot::plot_grid(plotlist = varList, ncol=3)
+```
+
+
+
+#### Heatmap of selected features, without lasso penalty (0.1 Pvalue)
+Plot all heatmaps
+```{r}
+heatMaps <- lassoPlot(lmResults, cleanData, freqCut = 1, coefCut = 1)
+```
+
+```{r heatmapLM, fig.height=4, fig.width=18}
+heatMaps <- heatMaps[!is.na(heatMaps)]
+plot_grid(heatMaps[[1]], heatMaps[[2]],
+          heatMaps[[4]], heatMaps[[5]], ncol=2)
+ggsave("../figures/Fig2C_lassoBH.pdf", height = 4, width = 18)
+```

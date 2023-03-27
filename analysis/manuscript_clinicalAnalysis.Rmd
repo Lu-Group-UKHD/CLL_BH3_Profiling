@@ -1,0 +1,883 @@
+---
+title: "Associate BH3 profiling data with clincal trial"
+author: "Junyan Lu"
+date: "2020 Sept 3"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#Packages
+library(jyluMisc)
+library(cowplot)
+library(pheatmap)
+library(readxl)
+library(limma)
+library(IHW)
+library(SummarizedExperiment)
+library(tidyverse)
+source("../code/utils.R")
+
+```
+
+
+# Read in clincal trial data
+
+```{r}
+filePath <- "../data/13092020 Patient Outcome Analysis - IBR plus FCR - for Junyan.xlsx"
+```
+
+
+## Read in outcome
+
+Only primary endpoint
+```{r}
+endTab <- readxl::read_xlsx(filePath, sheet = 1, range = "A2:J60")
+colnames(endTab) <- c("patID","prim_response","prim_MRD_PB","prim_MRD_BM", 
+                      "sec_cyc3_MRD","sec_cyc3_MRD_BM", 
+                      "sec_postFCR_MRD", "sec_postFCR_MRD_BM","CYCLE_3_Response","Post_FCR_Response")
+
+endGroup <- tibble(item = colnames(endTab)[2:10],
+                   endpoint = c(rep("Best response",3), 
+                                rep("Halfway through combination therapy\n(post cycle 3)",2), 
+                                rep("End of combination therapy\n(post-FCR)",2),
+                                "Halfway through combination therapy\n(post cycle 3)", 
+                                "End of combination therapy\n(post-FCR)"),
+                   response = c("Response", "MRD PB","MRD BM", "MRD PB", "MRD BM", "MRD PB","MRD BM", "Response","Response"))
+
+endTab <- mutate(endTab, prim_response = as.numeric(prim_response),
+                 patID = paste0("D",patID)) %>%
+  mutate_at(vars(prim_MRD_PB:sec_postFCR_MRD_BM), str_replace, "2","NA") %>%
+  mutate_at(vars(prim_MRD_PB:sec_postFCR_MRD_BM), as.numeric) %>%
+  mutate_at(vars(CYCLE_3_Response, Post_FCR_Response), str_replace,"Cri","CRI") %>%
+  mutate(prim_response = case_when(prim_response %in% c(1,2)~ "CR/CRi", prim_response == 0 ~ "PR"),
+         CYCLE_3_Response = case_when(CYCLE_3_Response %in% c("CR","CRI")~ "CR/CRi", 
+                                      CYCLE_3_Response %in% "PR" ~ "PR"),
+         Post_FCR_Response = case_when(Post_FCR_Response %in% c("CR","CRI")~ "CR/CRi", 
+                                      Post_FCR_Response %in% "PR" ~ "PR")) %>%
+  mutate_all(as.character) 
+```
+
+
+
+## Read in BH3 profiling data
+
+### Ex-vivo baseline
+```{r}
+baseTab <- readxl::read_xlsx(filePath, sheet = 1, range = "U2:AP60") %>%
+  mutate_all(str_replace,"[*]","") %>%
+  mutate_all(as.numeric) %>% mutate(patID = endTab$patID)
+colnames(baseTab) <- str_replace_all(colnames(baseTab), " ", "_") 
+baseTab <- baseTab %>% pivot_longer(-patID, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>% mutate(set = "Baseline")
+```
+
+
+### In vivo
+```{r}
+vivoTab <- readxl::read_xlsx(filePath, sheet = 1, range = "AR2:BM60") %>%
+  mutate_all(str_replace,"[*]","") %>%
+  mutate_all(as.numeric) %>% mutate(patID = endTab$patID)
+colnames(vivoTab) <- str_replace_all(colnames(vivoTab), " ", "_") 
+vivoTab <- vivoTab %>% pivot_longer(-patID, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>% mutate(set = "In_vivo")
+```
+
+
+#### Calculate robust z-score
+```{r}
+outCut <- 10
+outTab <- vivoTab %>% 
+  filter(!is.na(value)) %>% 
+  group_by(feature) %>%
+  mutate(zScore = (value - median(value))/mad(value), medDiff = value - median(value)) %>% 
+  ungroup() %>%
+  mutate(outlier = ifelse(abs(zScore) > outCut, TRUE, FALSE)) %>%
+  filter(outlier)
+```
+
+
+### Set outlier values to NA
+```{r}
+vivoTab <- left_join(vivoTab, select(outTab, patID, feature, outlier)) %>%
+  mutate(value = ifelse(outlier %in% TRUE, NA, value)) %>% select(-outlier)
+```
+
+
+### Ex vivo with Ibrutinib
+```{r}
+ibrTab <- readxl::read_xlsx(filePath, sheet = 1, range = "BO2:CI60") %>%
+  mutate_all(str_replace,"[*]","") %>%
+  mutate_all(as.numeric) %>% mutate(patID = endTab$patID)
+colnames(ibrTab) <- str_replace_all(colnames(ibrTab), " ", "_") 
+ibrTab <- ibrTab %>% pivot_longer(-patID, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value)) %>% mutate(set = "Ibr_DBP")
+```
+
+
+```{r}
+bh3Tab <- bind_rows(baseTab, vivoTab, ibrTab) 
+```
+
+
+
+## Read background
+```{r}
+annoTab <- readxl::read_xlsx(filePath, sheet = 1, range = "K2:S60")
+colnames(annoTab) <- c("sex","RaiStage", "ZAP70","IGHV","IGHV.type","IGHV.type2",
+                       "TP53", "NOTCH1","MYD88")
+annoTab <- mutate(annoTab, patID = endTab$patID) %>% 
+  select(patID, sex, RaiStage, ZAP70, IGHV, TP53, NOTCH1) %>%
+  mutate(sex = case_when(sex %in% "0" ~ "m", sex %in% "1" ~ "f", TRUE ~ sex),
+         ZAP70 = case_when(ZAP70 == "Positive" ~ "pos",
+                           ZAP70 == "Negative" ~ "neg", 
+                           TRUE ~ ZAP70),
+         RaiStage = as.character(as.numeric(RaiStage))) %>%
+  mutate(ZAP70 = ifelse(ZAP70 == "2", NA, ZAP70),
+         IGHV = as.character(as.numeric(IGHV)),
+         NOTCH1 = case_when(NOTCH1 == "Wildtype" ~ "0",
+                            NOTCH1 == "2" ~ "NA",
+                            TRUE ~ NOTCH1),
+         NOTCH1 = as.character(as.numeric(NOTCH1)),
+         TP53 = case_when(TP53 == "Wildtype" ~ "0",
+                            TP53 == "2" ~ "NA",
+                            TRUE ~ TP53),
+         TP53 = as.character(as.numeric(TP53)))
+
+
+```
+
+## Some samples need to be excluded
+```{r}
+exTab <- readxl::read_xlsx(filePath, sheet = 1, range = "A2:B60")
+colnames(exTab) <- c("patID","prim_response")
+exTab <- mutate(exTab, prim_response = as.numeric(prim_response),
+                 patID = paste0("D",patID)) %>%
+  filter(is.na(prim_response))
+
+bh3Tab <- filter(bh3Tab, ! patID %in% exTab$patID) %>%
+  separate(feature, c("peptide","conc"), extra = "drop", remove = FALSE, sep  = "_") %>%
+    mutate(peptide = str_replace_all(peptide, "-","_")) %>%
+  mutate(feature=str_replace(feature,"HRK-y","HRKy"),
+         peptide = str_replace(peptide, "HRK_y","HRKy"))
+```
+
+## Final patient number
+```{r}
+length(unique(bh3Tab$patID))
+
+
+endTab <- endTab %>%
+  pivot_longer(-patID, names_to = "item", values_to = "outcome") %>%
+  mutate(outcome =case_when(outcome %in% "0" ~ "neg",
+                          outcome %in% "1" ~ "pos",
+                          TRUE ~ outcome)) %>%
+  left_join(endGroup)
+```
+
+# Heatmap
+
+## Baseline
+```{r, echo=FALSE}
+#Prepare BH3 data matrix
+
+dataTab <- bh3Tab %>% filter(set == "Baseline") %>%
+  group_by(patID, peptide) %>%
+  summarise(value = mean(value))
+
+dataMat <- dataTab %>%
+  spread(key = peptide, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+patAnno <- annoTab %>% select(patID, sex, IGHV, TP53, NOTCH1) %>%
+  mutate(IGHV = case_when(IGHV == 1 ~ "M", IGHV == 0 ~ "U"),
+         TP53 = case_when(TP53 == 1 ~ "Mut", TP53 == 0 ~ "WT"),
+         NOTCH1 = case_when(NOTCH1 == 1 ~"Mut",NOTCH1 == 0 ~ "WT")) %>%
+  dplyr::rename(IGHV.status = IGHV)
+
+#prepare column annotations
+colAnno <- patAnno %>% data.frame() %>% column_to_rownames("patID")
+```
+
+```{r overviewHeatmap, fig.width=6, fig.height=6, echo=FALSE}
+dataMat.scaled <- t(mscale(t(dataMat), censor = 4))
+colorAnno <- list(pretreat = c(yes = colList[1], no = "white"),
+                  TP53 = c(Mut = colList[1], WT = "white"),
+                  NOTCH1 = c(Mut = colList[1], WT = "white"),
+                  trisomy12 = c(tri12 = colList[1],WT = "white"),
+                  sex = c(f = colList[3], m = colList[4]),
+                  Methylation_Cluster = c("HP" = colList[4], "IP" = colList[5], "LP" = colList[6]),
+                  IGHV.status = c(M = colList[1], U=colList[2]))
+pdf("../figures/Fig6B_Baseline.pdf", height = 6, width = 6)
+pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
+         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+         breaks = seq(-3,3, length.out =100), fontsize = 14,
+         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+dev.off()
+pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
+         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+         breaks = seq(-3,3, length.out =100), fontsize = 14,
+         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+```
+
+### Test associations with IGHV
+
+```{r}
+testTab <- dataTab %>% mutate(IGHV = patAnno[match(patID, patAnno$patID),]$IGHV.status) %>%
+  filter(!is.na(value), !is.na(IGHV))
+resTab <-  group_by(testTab, peptide) %>% nest() %>%
+  mutate(m = map(data, ~t.test(value ~ IGHV,.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  select(peptide, p.value, estimate) %>% arrange(p.value)
+```
+
+
+If multiple concentrations are identified as significant, only show the most significant concentration.
+```{r geneAssociationBox, fig.width=5, fig.height=4}
+pscr <- filter(resTab, p.value < 0.05) %>% mutate(Gene = "IGHV.status")
+give.n <- function(x){
+   return(data.frame(y = quantile(x,0.75), label = paste0("n=",length(x))))
+}
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$peptide
+   p <- formatC(pscr[i,]$p.value, digits = 2)
+  plotTab <- filter(testTab, peptide == featureName) %>%
+    filter(!is.na(IGHV))
+  
+  ggplot(plotTab, aes(x=IGHV, y = value, fill = IGHV)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= c(M = colList[1], U=colList[2])) +
+    ylab("Cyt C release") + xlab("") +
+    ggtitle(sprintf("%s(Baseline) ~ %s", featureName, "IGHV.status")) +
+    annotate(geom="text", label = bquote(italic("P")~"="~.(p)), x=Inf, y=Inf, hjust=1.1, vjust=2, size=5, col = "darkred") +
+    #geom_text(aes(label = gene),y = max(plotTab$value), stat = "count") +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5), size=6) +
+    theme_full +
+    theme(legend.position = "none")
+})
+pBox_baseline <- plotList[[1]]
+pBox_baseline
+```
+
+## In vivo
+```{r, echo=FALSE}
+#Prepare BH3 data matrix
+
+dataTab <- bh3Tab %>% filter(set == "In_vivo") %>%
+  group_by(patID, peptide) %>%
+  summarise(value = mean(value))
+
+dataMat <- dataTab %>%
+  spread(key = peptide, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+patAnno <- annoTab %>% select(patID, sex, IGHV, TP53, NOTCH1) %>%
+  mutate(IGHV = case_when(IGHV == 1 ~ "M", IGHV == 0 ~ "U"),
+         TP53 = case_when(TP53 == 1 ~ "Mut", TP53 == 0 ~ "WT"),
+         NOTCH1 = case_when(NOTCH1 == 1 ~"Mut",NOTCH1 == 0 ~ "WT")) %>%
+  dplyr::rename(IGHV.status = IGHV)
+
+#prepare column annotations
+colAnno <- patAnno %>% data.frame() %>% column_to_rownames("patID")
+```
+
+```{r overviewHeatmap_inVivo, fig.width=6, fig.height=6, echo=FALSE}
+dataMat.scaled <- t(mscale(t(dataMat), censor = 4))
+
+pdf("../figures/Fig6B_inVivo.pdf", height = 6, width = 6)
+pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
+         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+         breaks = seq(-3,3, length.out =100), fontsize = 14,
+         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+dev.off()
+
+pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
+         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
+         breaks = seq(-3,3, length.out =100), fontsize = 14,
+         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+```
+
+### Test associations with IGHV
+
+```{r}
+testTab <- dataTab %>% mutate(IGHV = patAnno[match(patID, patAnno$patID),]$IGHV.status) %>%
+  filter(!is.na(value), !is.na(IGHV))
+resTab <-  group_by(testTab, peptide) %>% nest() %>%
+  mutate(m = map(data, ~t.test(value ~ IGHV,.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>% unnest(res) %>%
+  select(peptide, p.value, estimate) %>% arrange(p.value)
+```
+
+```{r geneAssociationBox_invivo, fig.width=10, fig.height=8}
+pscr <- filter(resTab, p.value < 0.05) %>% mutate(Gene = "IGHV.status")
+give.n <- function(x){
+   return(data.frame(y = quantile(x,0.75), label = paste0("n=",length(x))))
+}
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$peptide
+  p <- formatC(pscr[i,]$p.value, digits = 2)
+  plotTab <- filter(testTab, peptide == featureName) %>%
+    filter(!is.na(IGHV))
+  
+  ggplot(plotTab, aes(x=IGHV, y = value, fill = IGHV)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= c(M = colList[1], U=colList[2])) +
+    ylab("Cyt C release") + xlab("") +
+    ggtitle(sprintf("%s(In vivo) ~ %s", featureName, "IGHV.status")) +
+    annotate(geom="text", label = bquote(italic("P")~"="~.(p)), x=Inf, y=Inf, hjust=1.1, vjust=2, size=5, col = "darkred") +
+    #geom_text(aes(label = gene),y = max(plotTab$value), stat = "count") +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5), size=6) +
+    theme_full +
+    theme(legend.position = "none")
+})
+cowplot::plot_grid(plotlist = plotList, ncol=2)
+```
+
+```{r, fig.height=4, fig.width=10}
+pBox_invivo <- plotList[[4]]
+plot_grid(pBox_baseline, pBox_invivo)
+ggsave("../figures/Fig6C_IGHVbox.pdf",height = 4, width = 10)
+```
+
+
+
+# Test for associations
+
+```{r}
+testTab <- left_join(bh3Tab, endTab, by = "patID") %>% filter(!is.na(value),!is.na(outcome), set != "Ibr_DBP")
+```
+
+```{r}
+testRes <- group_by(testTab, feature, set, item, peptide, conc, endpoint, response) %>%
+  nest() %>%
+  mutate(m=map(data,~t.test(value ~ as.factor(outcome),.,var.equal=TRUE))) %>%
+  mutate(res = map(m, broom::tidy)) %>%
+  unnest(res) %>% 
+  select(-data,-m) %>% ungroup() %>%
+  arrange(p.value) %>% mutate(p.adj = p.adjust(p.value, method = "BH"))
+```
+
+
+# Generate heatmap
+
+```{r}
+genPheatmap <- function(plotTab, endpoints, censor=5, cut = 0.05) {
+  
+  pList <- lapply(seq_along(endpoints), function(i) {
+    ep <- endpoints[i]
+    heatTab <- plotTab %>% filter(endpoint == ep) %>%
+      mutate(pSign = -log10(p.value)) %>%
+      mutate(pSign = case_when(pSign > censor ~ censor,
+                               pSign < -log10(cut) ~ 0,
+                               TRUE ~ pSign)) %>%
+      mutate(pSign = pSign*sign(estimate))
+  
+    p <- ggplot(heatTab, aes(x=response, y = conc, fill = pSign)) + 
+      geom_tile(size = 0.3, color = "white") + 
+      facet_wrap(~ peptide, ncol = 1, scales = "free_y", strip.position = "left") + 
+      scale_fill_gradient2(high = "red", mid = "white", low = "blue",
+                         name = bquote(-log[10]*"("*italic("P")~"value)"), limits = c(-censor,censor)) +
+      scale_x_discrete(position = "top") +
+      theme_full + theme(strip.text = element_text(face = "bold",size=15),
+                         
+                         axis.line = element_blank(),
+                         panel.border = element_rect(size=1.5),
+                       axis.title.y  = element_text(size =10),
+                       axis.title.x = element_text(size=16),
+                       axis.text.x = element_text(size=15),
+                       axis.text.y = element_text(size=15),
+                       strip.placement = "outside",
+                       legend.text = element_text(size=12),
+                       legend.title = element_text(size=12)) +
+      xlab(ep) + ylab("")
+    
+    if (i != 1) {
+      #not firt one, no y label
+      p <- p + theme(axis.text.y = element_blank(),
+                   axis.ticks.y = element_blank(),
+                   axis.title.y = element_blank(), 
+                   strip.text = element_blank())
+    }
+    
+    if (i != length(endpoints)) {
+      #not last one, no legend
+      p <- p + theme(legend.position = "none")
+    }
+    
+    p
+  })
+  #plot_grid(plotlist = pList, align = "hv", axis = "lr", ncol=length(endpoints))
+  egg::ggarrange(plots = pList, nrow=1)
+}
+```
+
+```{r, fig.height=8, fig.width=13}
+plotTab <- testRes %>% filter(set == "Baseline", peptide != "A_133")
+endpoints <- sort(unique(plotTab$endpoint))
+pdf("../figures/Fig6D_baseline.pdf", height = 8, width = 13, onefile = FALSE)
+genPheatmap(plotTab, endpoints)
+dev.off()
+genPheatmap(plotTab, endpoints)
+
+```
+
+```{r, fig.height=8, fig.width=13}
+plotTab <- testRes %>% filter(set == "In_vivo", peptide != "A_133")
+endpoints <- sort(unique(plotTab$endpoint))
+pdf("../figures/Fig6D_invivo.pdf", height = 8, width = 13, onefile = FALSE)
+genPheatmap(plotTab, endpoints)
+dev.off()
+genPheatmap(plotTab, endpoints)
+
+```
+
+# Plot example associations 
+
+```{r, fig.height=16, fig.width=12}
+pscr <- filter(testRes, p.value < 0.05, peptide == "ABT199", conc ==0.5) 
+outcomeCol <- c(pos = colList[3], neg = colList[6],
+                PR = colList[3], "CR/CRi" = colList[6])
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  rec <- pscr[i,]
+ 
+  plotTab <- filter(testTab, feature == rec$feature, set == rec$set, item == rec$item) %>%
+    filter(!is.na(outcome))
+  p<- formatC(rec$p.value, digits=2)
+  ggplot(plotTab, aes(x=outcome, y = value, fill = outcome)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= outcomeCol) +
+    ylab(sprintf("%s %sμM (%s) \n Cyt C release", rec$peptide, rec$conc, str_replace(rec$set,"_"," "))) + xlab(rec$response) +
+    annotate(geom="text", label = bquote(italic("P")~"="~.(p)),
+             x=Inf, y=Inf, hjust=1.1, vjust=2, size=5, col = "darkred") +
+    ggtitle(rec$endpoint) +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5), size=6) +
+    theme_full +
+    theme(legend.position = "none")
+})
+cowplot::plot_grid(plotlist = plotList, ncol=2, align = "hv")
+```
+### For figure 6E
+```{r, fig.width=12, fig.height=8}
+cowplot::plot_grid(plotlist = plotList[c(1,2,5,6)], ncol=2, align = "hv")
+ggsave("../figures/Fig6E_boxUni.pdf", width = 12, height = 8, device = cairo_pdf)
+```
+
+
+# Test for associations (adjusted for IGHV)
+
+```{r}
+testTab <- left_join(bh3Tab, endTab, by = "patID") %>% filter(!is.na(value),!is.na(outcome), set != "Ibr_DBP") %>%
+  mutate(IGHV = patAnno[match(patID, patAnno$patID),]$IGHV.status) %>% filter(!is.na(IGHV))
+```
+
+```{r}
+testRes <- group_by(testTab, feature, set, item, peptide, conc, endpoint, response) %>%
+  nest() %>%
+  mutate(m=map(data,~car::Anova(lm(value ~ IGHV + as.factor(outcome),.)))) %>%
+  mutate(res = map(m, broom::tidy)) %>%
+  unnest(res) %>% filter(term != "IGHV") %>%
+  select(-data,-m, -term, -sumsq, -df) %>% ungroup() %>%
+  arrange(p.value) %>% mutate(p.adj = p.adjust(p.value, method = "BH"))
+```
+
+
+```{r, fig.height=18, fig.width=14}
+pscr <- filter(testRes, p.value < 0.05, peptide == "ABT199") 
+outcomeCol <- c(pos = colList[3], neg = colList[6],
+                PR = colList[3], "CR/CRi" = colList[6])
+
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  rec <- pscr[i,] %>%
+    separate(endpoint, c("top","bottom"),"\n") %>%
+    mutate(bottom=ifelse(is.na(bottom),"",bottom))
+ 
+  plotTab <- filter(testTab, feature == rec$feature, set == rec$set, item == rec$item) %>%
+    filter(!is.na(outcome))
+  
+  pAnno <- formatC(rec$p.value, digits=2)
+  ggplot(plotTab, aes(x=outcome, y = value, fill = outcome)) + 
+    geom_boxplot(width=0.5) + geom_point() + scale_fill_manual(values= outcomeCol) +
+    ylab(sprintf("%s %sμM (%s) \n Cyt C release", rec$peptide, rec$conc, str_replace(rec$set,"_"," "))) + xlab(rec$response) +
+    ggtitle(bquote(atop(bold(.(rec$top)),bold(.(rec$bottom)*"("*bolditalic("P")*"="*.(pAnno)*")")))) +
+    stat_summary(fun.data = give.n, geom = "text", position = position_nudge(x=0.3,y=5),size=5) +
+    facet_wrap(~IGHV) +
+    theme_full +
+    theme(legend.position = "none", 
+          plot.title  = element_text(face = "bold"),
+          strip.text = element_text(size=16))
+})
+cowplot::plot_grid(plotlist = plotList, ncol=2)
+```
+### For figure 6F
+```{r, fig.width=7, fig.height=8}
+pSub <- plotList[c(3,7)]
+cowplot::plot_grid(plotlist = pSub, ncol=1)
+ggsave("../figures/Fig6F_boxIGHV.pdf", height = 8, width = 7, device = cairo_pdf)
+```
+
+
+
+## Does MRD status associated with IGHV status?
+```{r}
+mrdTab <- distinct(testTab, patID, item, outcome, endpoint, response, IGHV) %>%
+  filter(response %in% c("MRD PB","MRD BM")) %>%
+  mutate(outcome = factor(outcome), IGHV=factor(IGHV))
+resTab <- group_by(mrdTab, endpoint, response) %>% nest() %>%
+  mutate(m = map(data, ~chisq.test(.$outcome,.$IGHV))) %>%
+  mutate(res = map(m, broom::tidy)) %>%
+  unnest(res) %>%
+  select(endpoint, response, p.value) %>%
+  arrange(p.value)
+resTab
+```
+
+## Whether combining BH3 profiling and IGHV status can better predict outcome?
+
+```{r}
+groupTab <- group_by(testTab, feature, set, endpoint, response) %>% 
+  filter(response %in% c("MRD PB","MRD BM")) %>%
+  nest()
+multiResTab <- lapply(seq(nrow(groupTab)), function(i) {
+  rec <- groupTab[i,]
+  eachTab <- rec$data[[1]] %>% mutate(outcome = factor(outcome), 
+                                      IGHV = factor(IGHV)) %>%
+    mutate(outcome = as.numeric(outcome), IGHV = as.numeric(IGHV))
+  r2Pep <- summary(lm(outcome ~ value, eachTab))$r.squared
+  r2IGHV <- summary(lm(outcome ~ IGHV, eachTab))$r.squared
+  r2Com <- summary(lm(outcome ~ IGHV + value, eachTab))$adj.r.squared
+  p2Com <- summary(lm(outcome ~ IGHV + value, eachTab))
+  outTab <- select(rec, -data) %>%
+    mutate(r2Pep = r2Pep, r2IGHV=r2IGHV, r2Com= r2Com)
+}) %>%
+  bind_rows() %>%
+  arrange(desc(r2Com))
+```
+
+Cases that combining IGVH and BH3 profiling is better than each alone
+```{r}
+multiResTab.sig <- filter(multiResTab, r2Com > r2Pep & r2Com > r2IGHV)
+multiResTab.sig
+```
+
+Plot difference of R2
+```{r r2Bar, fig.height=15, fig.width=12}
+barPlotList <- lapply(seq(nrow(multiResTab.sig)), function(i) {
+  rec <- multiResTab.sig[i,]
+  
+  plotTab <- tibble(
+    feature = c("only IGHV", "only BH3", "IGHV + BH3"),
+    r2 = c(rec$r2IGHV, rec$r2IGHV, rec$r2Com)) %>%
+    mutate(feature =factor(feature, levels = rev(feature)))
+  
+  ggplot(plotTab, aes(x=feature, y=r2)) + 
+    geom_bar(stat="identity", aes(fill = feature), width = 0.5) +
+    scale_fill_manual(values = colList[3:5]) +
+    ggtitle(rec$feature) +
+    coord_flip() + ylab("Variance explained (R2)") + xlab("") +
+    theme_full + theme(legend.position = "none", plot.margin = margin(5,10,5,10))
+})
+
+plot_grid(plotlist = barPlotList, ncol=2)
+```
+
+# AUROC analysis
+
+## Univariate model
+
+```{r}
+library(pROC)
+
+testPartition <- function(y, ratio) {
+    #balanced sampling of test set
+    ord <- seq_along(y)
+    testIdx <- lapply(unique(y),function(n) {
+        subY <- ord[y == n]
+        sample(subY, size = as.integer(length(subY)  * ratio)) 
+    }) %>% do.call(c,.) %>% sort()
+    return(testIdx)
+}
+
+runLogistic <- function(x, y, testRatio = 0.3, repeats = 20) {
+   eachRes <- lapply(seq(repeats), function(i) {
+        smpTrain <- testPartition(y, 1-testRatio)
+        x <- data.frame(x)
+        y <- as.numeric(factor(y)) -1
+        yTrain <- y[smpTrain]
+        yTest <- y[-smpTrain]
+        xTrain <- x[smpTrain, ,drop=FALSE]
+        xTest <- x[-smpTrain,, drop=FALSE]
+        
+        dataIn <- data.frame(cbind(yTrain, xTrain))
+        mm <- glm(yTrain ~ x, data = dataIn,  family = "binomial")
+        
+        predTrain <- predict(mm, type="response")
+        aucTrain <- auc(yTrain, predTrain)[1]
+        #pROC.train <- ggroc(roc(yTrain, predTrain)) +
+        #  annotate("text", x=0.2,y=0.2, label = sprintf("AUROC = %1.2f",aucTrain), color = "red",size=6)+
+        #  theme_bw() + ggtitle("trainning set")
+        
+        pROC.train <- roc(yTrain, predTrain)
+        
+        if (testRatio >0) {
+          predTest <- predict(mm, newdata = xTest, type = "response")
+          aucTest <- auc(yTest, predTest)[1]
+          #pROC.test <- ggroc(roc(yTest, predTest)) +
+          #  annotate("text", x=0.2,y=0.2, label = sprintf("AUROC = %1.2f",aucTest), color = "red",size=6)+
+          #  theme_bw() + ggtitle("test set")
+          pROC.test <- roc(yTest, predTest)
+        } else {
+          aucTest = NA
+          pROC.test =NA
+        }
+        
+        
+        tibble(rep = i, aucTrain = aucTrain, aucTest = aucTest, pROC.train = list(pROC.train), pROC.test = list(pROC.test))
+
+    }) %>% bind_rows()
+  
+  rocTrain <- ggroc(eachRes$pROC.train) + annotate("text", x=0.3,y=0.1, label = sprintf("mean AUROC = %1.2f",mean(eachRes$aucTrain)), color = "darkred",size=5) + 
+    theme_full + theme(legend.position = "none")
+  if(testRatio > 0) {
+     rocTest <- ggroc(eachRes$pROC.test) + annotate("text", x=0.3,y=0.1, label = sprintf("mean AUROC = %1.2f",mean(eachRes$aucTest)), color = "darkred",size=5) + 
+       theme_full + theme(legend.position = "none")
+  } else rocTest <- NA
+ 
+  
+  return(tibble(aucTrain = mean(eachRes$aucTrain), aucTest = mean(eachRes$aucTest),
+         sdTrain = sd(eachRes$aucTrain), sdTest = sd(eachRes$aucTest),
+         rocTrain = list(rocTrain),
+         rocTest = list(rocTest)))
+}
+```
+
+```{r, warning=FALSE, message=FALSE}
+uniResTab <- full_join(bh3Tab, endTab, by = "patID") %>% filter(!is.na(value),!is.na(outcome), set != "Ibr_DBP") %>%
+  mutate(feature = paste0(peptide,"_",conc,"uM")) %>%
+  group_by(feature, item, set) %>% nest() %>%
+  mutate(res = map(data, ~runLogistic(.$value, .$outcome, testRatio = 0.3, repeats = 20))) %>%
+  unnest(res)
+
+```
+
+```{r}
+resultTab <- left_join(uniResTab, distinct(endTab, item, endpoint, response)) %>%
+  arrange(desc(aucTest))
+```
+
+
+### Summarise the auc per each outcome
+```{r, fig.height=8, fig.width=10}
+plotList <- lapply(unique(resultTab$item), function(eachItem) {
+  plotTab <- filter(resultTab, item == eachItem) %>%
+    select(-data, -rocTrain, -rocTest) %>%
+    pivot_longer(c(aucTrain, aucTest, sdTrain, sdTest),names_to = "type", values_to = "value") %>%
+    mutate(trainOrTest = str_extract(type,"Train|Test"),
+           sdOrMean = str_extract(type, "sd|auc")) %>%
+    select(-type) %>%
+    pivot_wider(names_from = sdOrMean, values_from = value) %>%
+    mutate(trainOrTest = factor(trainOrTest, levels =c("Train","Test")))
+  
+  ggplot(plotTab, aes(x=feature, y = auc, fill = trainOrTest)) + 
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_errorbar(aes(ymax = auc+sd, ymin=auc-sd), position = "dodge2", linewidth=0.3 ) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "darkred") +
+    scale_fill_manual(values = c(Train = colList[3], Test = colList[4]), name = "Set") +
+    ylim(0,1.1) +
+    facet_wrap(~set, ncol=1) +
+    theme_full +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    xlab("") + ylab("AUROC") + 
+    ggtitle(paste0(unique(plotTab$endpoint)," (",unique(plotTab$response), ")"))
+  
+})
+
+ggsave("../figures/clinic_ROC_summary.pdf", cowplot::plot_grid(plotlist = plotList, ncol=2),
+       height = 40, width = 30)
+```
+
+### Plot best AUROC values
+```{r, fig.height=50, fig.width=25}
+pepAnno <- bh3Tab %>% distinct(peptide, conc) %>%
+  mutate(feature = paste0(peptide,"_",conc,"uM")) 
+plotResTab <- left_join(resultTab, pepAnno)
+pList <- lapply(seq(20), function(i) {
+  rec <- plotResTab[i,]
+  pTrain <- rec$rocTrain[[1]] + ggtitle("Training set") 
+  pTest <- rec$rocTest[[1]] + ggtitle("Test set")
+  pCom <- plot_grid(pTrain, pTest, ncol=2)
+  textTitle <- str_replace(rec$endpoint, "\n"," ")
+  pTitle <-  ggdraw() + 
+      draw_label(
+        bquote(bold(atop(.(textTitle)~"("*.(rec$response)*")",
+                    "~"~.(rec$peptide)~"("*.(rec$conc)*mu*"M)"))),size=18)
+  plot_grid(pTitle, pCom,ncol=1, rel_heights = c(0.3, 1))
+})
+
+plot_grid(plotlist = pList, ncol=2)
+ggsave("../figures/ROCplot_top20.pdf", height = 50, width = 20, limitsize = FALSE)
+```
+
+
+## Multi-variate model
+```{r}
+library(ROCR)
+library(glmnet)
+
+
+#Function for multi-variant binomial regression
+runGlm.bin <- function(X, y, alpha=1, repeats=20, folds = 3, testRatio = NULL, lambda = "lambda.1se") {
+    modelList <- list()
+    lambdaList <- c()
+    aucCV <- c()
+    aucTest <- c()
+    rocTest <- list()
+    coefMat  <- matrix(NA, ncol(X), repeats)
+    rownames(coefMat) <- colnames(X)
+    
+    for (i in seq(repeats)) {
+        if (!is.null(testRatio)) {
+            testIdx <- testPartition(y, testRatio)
+            X.test <- X[testIdx,,drop=FALSE]
+            X.train <- X[-testIdx,, drop=FALSE]
+            y.test <- y[testIdx]
+            y.train <- y[-testIdx]
+        } else {
+            X.train <- X
+            y.train <- y
+        }
+        
+        vecFold <- mltools::folds(y.train,nfolds = folds, stratified = TRUE)
+        
+        #train model
+        res <- cv.glmnet(X.train,y.train, type.measure = "auc",
+                         foldid = vecFold, alpha = alpha, standardize = FALSE,
+                         intercept = TRUE, family = "binomial")
+        lambdaList <- c(lambdaList, res[[lambda]])
+        aucCV <- c(aucCV, res$cvm[res$lambda == res[[lambda]]])
+        modelList[[i]] <- res
+        coefMat[,i] <- coef(res, s = lambda)[-1]
+        
+        #test model if testRatio is speficied
+        if(!is.null(testRatio)) {
+            rocRes <- plotROC(res, X.test, y.test, lambda)
+            aucTest <- c(aucTest, rocRes$auc)
+            rocTest[[i]] <- rocRes$plot
+        }
+    }
+    list(modelList = modelList, lambdaList = lambdaList, aucCV = aucCV, coefMat = coefMat,
+         aucTest = aucTest, rocTest = rocTest)
+}
+
+
+
+
+
+#function to plot ROC curves
+plotROC <- function(glmModel, X, y, lambda = "lambda.1se") {
+    lambdaChose <- glmModel[[lambda]]
+    glmPred <- prediction(predict(glmModel, type = "response", newx = X, s=lambdaChose), y)
+    glmPerform <- performance(glmPred,"tpr","fpr")
+    aucVal <- performance(glmPred, measure = "auc")@y.values[[1]]
+    xname <- glmPerform@x.name
+    yname <- glmPerform@y.name
+    plotTab <- tibble(x= glmPerform@x.values[[1]],
+                      y = glmPerform@y.values[[1]])
+    p <- ggplot(plotTab, aes(x=x, y =y )) + geom_line(color = "red") +
+        xlab(xname) + ylab(yname) + theme(panel.grid = element_blank())
+    
+    if (!is.null(aucVal)) {
+        p <- p + annotate("text", x= 0.75, y = 0.25, label = sprintf("AUC: %1.2f", aucVal))
+    }
+    list(plot=p, auc = aucVal)
+}
+```
+
+## Prepare data
+
+### Predictors (X)
+```{r}
+#baseline
+X_base <- bh3Tab %>% filter(set == "Baseline") %>% 
+  select(patID, feature, value) %>%
+  pivot_wider(names_from = feature, values_from = value) %>%
+  data.frame() %>% column_to_rownames("patID")
+X_base <- X_base[complete.cases(X_base),]
+X_base <- scale(X_base)
+#invivo
+X_invivo <- bh3Tab %>% filter(set == "In_vivo") %>% 
+  select(patID, feature, value) %>%
+  pivot_wider(names_from = feature, values_from = value) %>%
+  data.frame() %>% column_to_rownames("patID")
+X_invivo <- X_invivo[complete.cases(X_invivo),]
+X_invivo <- scale(X_invivo)
+```
+
+### Responses (Y)
+```{r}
+Y_list <- lapply(unique(endTab$item), function(x) {
+  yTab <- filter(endTab, item == x) %>%
+    filter(!is.na(outcome))
+  structure(factor(yTab$outcome), names = yTab$patID)
+  })
+names(Y_list) <- unique(endTab$item)
+```
+
+## Perform LASSO regression
+
+```{r, warning=FALSE, message=FALSE, error=FALSE}
+set.seed(1118)
+baseRes <- lapply(names(Y_list), function(item) {
+  y <- Y_list[[item]]
+  X <- X_base
+  overPat <- intersect(rownames(X),names(y))
+  y <- y[overPat]
+  X <- X[overPat,]
+  res <- runGlm.bin(X,y,testRatio = 0.4)
+})
+names(baseRes) <- names(Y_list)
+
+invivoRes <- lapply(names(Y_list), function(item) {
+  y <- Y_list[[item]]
+  X <- X_invivo
+  overPat <- intersect(rownames(X),names(y))
+  y <- y[overPat]
+  X <- X[overPat,]
+  res <- runGlm.bin(X,y,testRatio = 0.4)
+})
+names(invivoRes) <- names(Y_list)
+
+```
+
+Summarise AUROC
+```{r, fig.height=8, fig.width=12}
+sumBaseline <- lapply(names(baseRes), function(item) {
+  eachRes <- baseRes[[item]]
+  tibble(item = item, aucCV = eachRes$aucCV, aucTest = eachRes$aucTest, type = "Baseline") 
+}) %>%
+  bind_rows()
+
+sumInvivo <- lapply(names(invivoRes), function(item) {
+  eachRes <- invivoRes[[item]]
+  tibble(item = item, aucCV = eachRes$aucCV, aucTest = eachRes$aucTest, type = "In_vivo") 
+}) %>%
+  bind_rows()
+
+sumTab <- bind_rows(sumBaseline, sumInvivo) %>% 
+  pivot_longer(c(aucCV, aucTest), names_to = "testGroup", values_to = "auc") %>%
+  group_by(item, type, testGroup) %>%
+  summarise(meanAUC = mean(auc,na.rm=TRUE), sdAUC = sd(auc, na.rm=TRUE))
+
+ggplot(sumTab, aes(x=item,y=meanAUC, fill = testGroup)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymax = meanAUC +sdAUC, ymin = meanAUC-sdAUC), position = "dodge") +
+  facet_wrap(~type, nrow = 2) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
