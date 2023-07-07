@@ -1,19 +1,16 @@
 ---
 title: "Figures for BH3 and drug responses analyses"
 author: "Junyan Lu"
-date: "2020 Sept 3"
-output: workflowr::wflow_html
-editor_options:
-  chunk_output_type: inline
+output: 
+    BiocStyle::html_document
 ---
 
 ```{r, echo=FALSE}
-knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = TRUE, dev = c("png","pdf"))
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = TRUE)
 ```
 
 ```{r, warning=FALSE, message=FALSE, echo=FALSE}
 #Packages
-library(jyluMisc)
 library(qgraph)
 library(cowplot)
 library(limma)
@@ -28,10 +25,7 @@ library(tidyverse)
 
 ```{r, echo=FALSE, warning=FALSE}
 source("../code/utils.R")
-
-load("../output/dynamicBH3.RData")
-load("../../var/patmeta_200806.RData")
-load("../../var/IC50_170823.RData")
+load("../data/allData.RData")
 ```
 
 Use baseline level from DBP profiling
@@ -54,7 +48,6 @@ patAnno <- distinct(dataBH3, patID, sampleID) %>%
 
 Drug resposne data (IC50 screen)
 ```{r, echo=FALSE}
-#Load and process drug response data
 #how many samples are tested in the BH3 profiling?
 overSample <- intersect(ic50$patientID, dataBH3$patID)
 #length(overSample)
@@ -132,7 +125,7 @@ pSumPlot <- ggplot(plotTab, aes(x=Drug, y = -log10(P.Value), fill = peptide)) +
   xlab("") + ylab(bquote(-log[10]~"("*italic(P)~"value)"))
 
 pSumPlot
-ggsave("../figures/Fig4A_drugPsumPlot.pdf", width = 10, height = 5)
+#ggsave("../figures/Fig4A_drugPsumPlot.pdf", width = 10, height = 5)
 ```
 
 
@@ -218,7 +211,7 @@ ggraph(tidyNet, layout =  "igraph", algorithm = "nicely") +
   scale_size_manual(values = c(source=29, target=0))+
   scale_edge_color_brewer(palette = "Set2") +
   theme_graph() + theme(legend.position = "none") 
-ggsave("../figures/FigS8_drugPepNet.pdf", height = 10, width = 10)
+#ggsave("../figures/FigS8_drugPepNet.pdf", height = 10, width = 10)
 ```
 
 ### Plot interesing pairs
@@ -251,7 +244,7 @@ corPlotList <- lapply(drugList, function(n) {
 })
 
 plot_grid(plotlist = corPlotList, ncol=3)
-ggsave("../figures/FigS10_drugCor.pdf", height = 13, width = 12)
+#ggsave("../figures/FigS10_drugCor.pdf", height = 13, width = 12)
 
 ```
 
@@ -275,7 +268,7 @@ barPlotList <- lapply(drugList, function(n) {
 })
 
 plot_grid(plotlist = barPlotList, ncol=2)
-ggsave("../figures/Fig4C_R2plot.pdf", height = 11, width = 11)
+#ggsave("../figures/Fig4C_R2plot.pdf", height = 11, width = 11)
 ```
 
 ### Multi-variate feature selection with LASSO penalty
@@ -336,7 +329,7 @@ cleanData <- generateData.drug(inclSet, censor = 5)
 
 
 Perform lasso regression
-```{r, lasso all, cache=TRUE, warning=FALSE, message=FALSE}
+```{r, lasso all,  warning=FALSE, message=FALSE}
 library(glmnet)
 lassoResults <- list()
 for (eachMeasure in names(cleanData$allResponse)) {
@@ -361,7 +354,7 @@ Function for plotting variance explained for each measurement
 ```{r drugR2, fig.height=12, fig.width=15, echo=F, warning=FALSE, message=FALSE}
 varList <- plotVar(lassoResults, maxY = 0.8)
 cowplot::plot_grid(plotlist = varList, ncol=4)
-ggsave("../figures/FigS11_varExp.pdf", height = 12, width = 15)
+#ggsave("../figures/FigS11_varExp.pdf", height = 12, width = 15)
 ```
 
 
@@ -385,7 +378,7 @@ Vgg = ggplot(data=data.frame(x=1, y=as.numeric(names(color4viab))), aes(x=x, y=y
 pLegend <- get_legend(Vgg)
 
 plot_grid(plot_grid(plotlist= heatMaps, ncol=1), pLegend, ncol=2, rel_widths = c(1,0.1))
-ggsave("../figures/Fig4B_drugLassoPlot.pdf", height = 13, width = 8)
+#ggsave("../figures/Fig4B_drugLassoPlot.pdf", height = 13, width = 8)
 ```
 
 # Correlation between BH3 profile (individual concentrations) and drug responses (AUC)
@@ -455,7 +448,7 @@ pSumHeat <- ggplot(plotTab, aes(x=factor(conc), y = Drug, fill = pSign)) + geom_
                      axis.text.x = element_text(size=14, angle = 90, hjust = 1, vjust = .5)) +
   ylab("Drug") + xlab("Peptide concentration")
 pSumHeat
-ggsave("../figures/figS9_drugPheatMap.pdf", width = 14, height = 5)
+#ggsave("../figures/figS9_drugPheatMap.pdf", width = 14, height = 5)
 ```
 
 # Correlation between BH3 profile (AUC) and drug (individual concentrations)
@@ -520,7 +513,6 @@ pSumHeat
 # Correlation with estimated in vivo responses
 
 ```{r}
-load("../../var/inVivoEffect.RData")
 untreatSample <- filter(treatmentTab, pretreat %in% 0)$sampleID
 testTab <- filter(inVivoEffect, patientID %in% dataBH3.auc$patID) %>% 
   pivot_longer(lymDrop:dropRate, names_to="measure",values_to="lymVal") %>%
@@ -572,7 +564,7 @@ plotList <- lapply(seq(nrow(resTab.sig)), function(i) {
 })
 
 cowplot::plot_grid(plotlist = plotList, ncol=2)
-ggsave("../figures/Fig4D_drugInVivo.pdf", height = 5, width = 11)
+#ggsave("../figures/Fig4D_drugInVivo.pdf", height = 5, width = 11)
 ```
 
 

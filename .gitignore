@@ -1,5 +1,5 @@
 .Rproj
 .DS_Store
 analysis/.DS_Store
-output/.DS_Store
-analysis/.Rhistory
+results/.DS_Store
+.Rhistory

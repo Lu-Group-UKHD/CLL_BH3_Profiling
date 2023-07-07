@@ -1,10 +1,8 @@
 ---
 title: "Associate BH3 profiling data with clincal trial"
 author: "Junyan Lu"
-date: "2020 Sept 3"
-output: workflowr::wflow_html
-editor_options:
-  chunk_output_type: inline
+output: 
+    BiocStyle::html_document
 ---
 
 ```{r, echo=FALSE}
@@ -13,23 +11,20 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = 
 
 ```{r, warning=FALSE, message=FALSE, echo=FALSE}
 #Packages
-library(jyluMisc)
 library(cowplot)
 library(pheatmap)
 library(readxl)
 library(limma)
-library(IHW)
 library(SummarizedExperiment)
 library(tidyverse)
 source("../code/utils.R")
-
 ```
 
 
 # Read in clincal trial data
 
 ```{r}
-filePath <- "../data/13092020 Patient Outcome Analysis - IBR plus FCR - for Junyan.xlsx"
+filePath <- "../data/13092020 Patient Outcome Analysis - IBR plus FCR.xlsx"
 ```
 
 
@@ -214,16 +209,12 @@ colorAnno <- list(pretreat = c(yes = colList[1], no = "white"),
                   sex = c(f = colList[3], m = colList[4]),
                   Methylation_Cluster = c("HP" = colList[4], "IP" = colList[5], "LP" = colList[6]),
                   IGHV.status = c(M = colList[1], U=colList[2]))
-pdf("../figures/Fig6B_Baseline.pdf", height = 6, width = 6)
+#pdf("../figures/Fig6B_Baseline.pdf", height = 6, width = 6)
 pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
          color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
          breaks = seq(-3,3, length.out =100), fontsize = 14,
          show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
-dev.off()
-pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
-         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
-         breaks = seq(-3,3, length.out =100), fontsize = 14,
-         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+#dev.off()
 ```
 
 ### Test associations with IGHV
@@ -291,17 +282,14 @@ colAnno <- patAnno %>% data.frame() %>% column_to_rownames("patID")
 ```{r overviewHeatmap_inVivo, fig.width=6, fig.height=6, echo=FALSE}
 dataMat.scaled <- t(mscale(t(dataMat), censor = 4))
 
-pdf("../figures/Fig6B_inVivo.pdf", height = 6, width = 6)
+#pdf("../figures/Fig6B_inVivo.pdf", height = 6, width = 6)
 pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
          color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
          breaks = seq(-3,3, length.out =100), fontsize = 14,
          show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
-dev.off()
+#dev.off()
 
-pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none", 
-         color = colorRampPalette(c(colList[2],"white",colList[1]))(100),
-         breaks = seq(-3,3, length.out =100), fontsize = 14,
-         show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, treeheight_row = 0, treeheight_col = 10)
+
 ```
 
 ### Test associations with IGHV
@@ -343,7 +331,7 @@ cowplot::plot_grid(plotlist = plotList, ncol=2)
 ```{r, fig.height=4, fig.width=10}
 pBox_invivo <- plotList[[4]]
 plot_grid(pBox_baseline, pBox_invivo)
-ggsave("../figures/Fig6C_IGHVbox.pdf",height = 4, width = 10)
+#ggsave("../figures/Fig6C_IGHVbox.pdf",height = 4, width = 10)
 ```
 
 
@@ -421,9 +409,9 @@ genPheatmap <- function(plotTab, endpoints, censor=5, cut = 0.05) {
 ```{r, fig.height=8, fig.width=13}
 plotTab <- testRes %>% filter(set == "Baseline", peptide != "A_133")
 endpoints <- sort(unique(plotTab$endpoint))
-pdf("../figures/Fig6D_baseline.pdf", height = 8, width = 13, onefile = FALSE)
-genPheatmap(plotTab, endpoints)
-dev.off()
+#pdf("../figures/Fig6D_baseline.pdf", height = 8, width = 13, onefile = FALSE)
+#genPheatmap(plotTab, endpoints)
+#dev.off()
 genPheatmap(plotTab, endpoints)
 
 ```
@@ -431,9 +419,9 @@ genPheatmap(plotTab, endpoints)
 ```{r, fig.height=8, fig.width=13}
 plotTab <- testRes %>% filter(set == "In_vivo", peptide != "A_133")
 endpoints <- sort(unique(plotTab$endpoint))
-pdf("../figures/Fig6D_invivo.pdf", height = 8, width = 13, onefile = FALSE)
-genPheatmap(plotTab, endpoints)
-dev.off()
+#pdf("../figures/Fig6D_invivo.pdf", height = 8, width = 13, onefile = FALSE)
+#genPheatmap(plotTab, endpoints)
+#dev.off()
 genPheatmap(plotTab, endpoints)
 
 ```
@@ -466,7 +454,7 @@ cowplot::plot_grid(plotlist = plotList, ncol=2, align = "hv")
 ### For figure 6E
 ```{r, fig.width=12, fig.height=8}
 cowplot::plot_grid(plotlist = plotList[c(1,2,5,6)], ncol=2, align = "hv")
-ggsave("../figures/Fig6E_boxUni.pdf", width = 12, height = 8, device = cairo_pdf)
+#ggsave("../figures/Fig6E_boxUni.pdf", width = 12, height = 8, device = cairo_pdf)
 ```
 
 
@@ -519,7 +507,7 @@ cowplot::plot_grid(plotlist = plotList, ncol=2)
 ```{r, fig.width=7, fig.height=8}
 pSub <- plotList[c(3,7)]
 cowplot::plot_grid(plotlist = pSub, ncol=1)
-ggsave("../figures/Fig6F_boxIGHV.pdf", height = 8, width = 7, device = cairo_pdf)
+#ggsave("../figures/Fig6F_boxIGHV.pdf", height = 8, width = 7, device = cairo_pdf)
 ```
 
 
@@ -668,216 +656,9 @@ uniResTab <- full_join(bh3Tab, endTab, by = "patID") %>% filter(!is.na(value),!i
 
 ```{r}
 resultTab <- left_join(uniResTab, distinct(endTab, item, endpoint, response)) %>%
-  arrange(desc(aucTest))
+  arrange(desc(aucTest)) %>%
+  select(-data, -rocTrain, -rocTest)
+writexl::write_xlsx(resultTab, path  = "../results/univariate_AUROC.xlsx")
 ```
-
-
-### Summarise the auc per each outcome
-```{r, fig.height=8, fig.width=10}
-plotList <- lapply(unique(resultTab$item), function(eachItem) {
-  plotTab <- filter(resultTab, item == eachItem) %>%
-    select(-data, -rocTrain, -rocTest) %>%
-    pivot_longer(c(aucTrain, aucTest, sdTrain, sdTest),names_to = "type", values_to = "value") %>%
-    mutate(trainOrTest = str_extract(type,"Train|Test"),
-           sdOrMean = str_extract(type, "sd|auc")) %>%
-    select(-type) %>%
-    pivot_wider(names_from = sdOrMean, values_from = value) %>%
-    mutate(trainOrTest = factor(trainOrTest, levels =c("Train","Test")))
-  
-  ggplot(plotTab, aes(x=feature, y = auc, fill = trainOrTest)) + 
-    geom_bar(stat = "identity", position = "dodge") +
-    geom_errorbar(aes(ymax = auc+sd, ymin=auc-sd), position = "dodge2", linewidth=0.3 ) +
-    geom_hline(yintercept = 0.5, linetype = "dashed", color = "darkred") +
-    scale_fill_manual(values = c(Train = colList[3], Test = colList[4]), name = "Set") +
-    ylim(0,1.1) +
-    facet_wrap(~set, ncol=1) +
-    theme_full +
-    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
-    xlab("") + ylab("AUROC") + 
-    ggtitle(paste0(unique(plotTab$endpoint)," (",unique(plotTab$response), ")"))
-  
-})
-
-ggsave("../figures/clinic_ROC_summary.pdf", cowplot::plot_grid(plotlist = plotList, ncol=2),
-       height = 40, width = 30)
-```
-
-### Plot best AUROC values
-```{r, fig.height=50, fig.width=25}
-pepAnno <- bh3Tab %>% distinct(peptide, conc) %>%
-  mutate(feature = paste0(peptide,"_",conc,"uM")) 
-plotResTab <- left_join(resultTab, pepAnno)
-pList <- lapply(seq(20), function(i) {
-  rec <- plotResTab[i,]
-  pTrain <- rec$rocTrain[[1]] + ggtitle("Training set") 
-  pTest <- rec$rocTest[[1]] + ggtitle("Test set")
-  pCom <- plot_grid(pTrain, pTest, ncol=2)
-  textTitle <- str_replace(rec$endpoint, "\n"," ")
-  pTitle <-  ggdraw() + 
-      draw_label(
-        bquote(bold(atop(.(textTitle)~"("*.(rec$response)*")",
-                    "~"~.(rec$peptide)~"("*.(rec$conc)*mu*"M)"))),size=18)
-  plot_grid(pTitle, pCom,ncol=1, rel_heights = c(0.3, 1))
-})
-
-plot_grid(plotlist = pList, ncol=2)
-ggsave("../figures/ROCplot_top20.pdf", height = 50, width = 20, limitsize = FALSE)
-```
-
-
-## Multi-variate model
-```{r}
-library(ROCR)
-library(glmnet)
-
-
-#Function for multi-variant binomial regression
-runGlm.bin <- function(X, y, alpha=1, repeats=20, folds = 3, testRatio = NULL, lambda = "lambda.1se") {
-    modelList <- list()
-    lambdaList <- c()
-    aucCV <- c()
-    aucTest <- c()
-    rocTest <- list()
-    coefMat  <- matrix(NA, ncol(X), repeats)
-    rownames(coefMat) <- colnames(X)
-    
-    for (i in seq(repeats)) {
-        if (!is.null(testRatio)) {
-            testIdx <- testPartition(y, testRatio)
-            X.test <- X[testIdx,,drop=FALSE]
-            X.train <- X[-testIdx,, drop=FALSE]
-            y.test <- y[testIdx]
-            y.train <- y[-testIdx]
-        } else {
-            X.train <- X
-            y.train <- y
-        }
-        
-        vecFold <- mltools::folds(y.train,nfolds = folds, stratified = TRUE)
-        
-        #train model
-        res <- cv.glmnet(X.train,y.train, type.measure = "auc",
-                         foldid = vecFold, alpha = alpha, standardize = FALSE,
-                         intercept = TRUE, family = "binomial")
-        lambdaList <- c(lambdaList, res[[lambda]])
-        aucCV <- c(aucCV, res$cvm[res$lambda == res[[lambda]]])
-        modelList[[i]] <- res
-        coefMat[,i] <- coef(res, s = lambda)[-1]
-        
-        #test model if testRatio is speficied
-        if(!is.null(testRatio)) {
-            rocRes <- plotROC(res, X.test, y.test, lambda)
-            aucTest <- c(aucTest, rocRes$auc)
-            rocTest[[i]] <- rocRes$plot
-        }
-    }
-    list(modelList = modelList, lambdaList = lambdaList, aucCV = aucCV, coefMat = coefMat,
-         aucTest = aucTest, rocTest = rocTest)
-}
-
-
-
-
-
-#function to plot ROC curves
-plotROC <- function(glmModel, X, y, lambda = "lambda.1se") {
-    lambdaChose <- glmModel[[lambda]]
-    glmPred <- prediction(predict(glmModel, type = "response", newx = X, s=lambdaChose), y)
-    glmPerform <- performance(glmPred,"tpr","fpr")
-    aucVal <- performance(glmPred, measure = "auc")@y.values[[1]]
-    xname <- glmPerform@x.name
-    yname <- glmPerform@y.name
-    plotTab <- tibble(x= glmPerform@x.values[[1]],
-                      y = glmPerform@y.values[[1]])
-    p <- ggplot(plotTab, aes(x=x, y =y )) + geom_line(color = "red") +
-        xlab(xname) + ylab(yname) + theme(panel.grid = element_blank())
-    
-    if (!is.null(aucVal)) {
-        p <- p + annotate("text", x= 0.75, y = 0.25, label = sprintf("AUC: %1.2f", aucVal))
-    }
-    list(plot=p, auc = aucVal)
-}
-```
-
-## Prepare data
-
-### Predictors (X)
-```{r}
-#baseline
-X_base <- bh3Tab %>% filter(set == "Baseline") %>% 
-  select(patID, feature, value) %>%
-  pivot_wider(names_from = feature, values_from = value) %>%
-  data.frame() %>% column_to_rownames("patID")
-X_base <- X_base[complete.cases(X_base),]
-X_base <- scale(X_base)
-#invivo
-X_invivo <- bh3Tab %>% filter(set == "In_vivo") %>% 
-  select(patID, feature, value) %>%
-  pivot_wider(names_from = feature, values_from = value) %>%
-  data.frame() %>% column_to_rownames("patID")
-X_invivo <- X_invivo[complete.cases(X_invivo),]
-X_invivo <- scale(X_invivo)
-```
-
-### Responses (Y)
-```{r}
-Y_list <- lapply(unique(endTab$item), function(x) {
-  yTab <- filter(endTab, item == x) %>%
-    filter(!is.na(outcome))
-  structure(factor(yTab$outcome), names = yTab$patID)
-  })
-names(Y_list) <- unique(endTab$item)
-```
-
-## Perform LASSO regression
-
-```{r, warning=FALSE, message=FALSE, error=FALSE}
-set.seed(1118)
-baseRes <- lapply(names(Y_list), function(item) {
-  y <- Y_list[[item]]
-  X <- X_base
-  overPat <- intersect(rownames(X),names(y))
-  y <- y[overPat]
-  X <- X[overPat,]
-  res <- runGlm.bin(X,y,testRatio = 0.4)
-})
-names(baseRes) <- names(Y_list)
-
-invivoRes <- lapply(names(Y_list), function(item) {
-  y <- Y_list[[item]]
-  X <- X_invivo
-  overPat <- intersect(rownames(X),names(y))
-  y <- y[overPat]
-  X <- X[overPat,]
-  res <- runGlm.bin(X,y,testRatio = 0.4)
-})
-names(invivoRes) <- names(Y_list)
-
-```
-
-Summarise AUROC
-```{r, fig.height=8, fig.width=12}
-sumBaseline <- lapply(names(baseRes), function(item) {
-  eachRes <- baseRes[[item]]
-  tibble(item = item, aucCV = eachRes$aucCV, aucTest = eachRes$aucTest, type = "Baseline") 
-}) %>%
-  bind_rows()
-
-sumInvivo <- lapply(names(invivoRes), function(item) {
-  eachRes <- invivoRes[[item]]
-  tibble(item = item, aucCV = eachRes$aucCV, aucTest = eachRes$aucTest, type = "In_vivo") 
-}) %>%
-  bind_rows()
-
-sumTab <- bind_rows(sumBaseline, sumInvivo) %>% 
-  pivot_longer(c(aucCV, aucTest), names_to = "testGroup", values_to = "auc") %>%
-  group_by(item, type, testGroup) %>%
-  summarise(meanAUC = mean(auc,na.rm=TRUE), sdAUC = sd(auc, na.rm=TRUE))
-
-ggplot(sumTab, aes(x=item,y=meanAUC, fill = testGroup)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  geom_errorbar(aes(ymax = meanAUC +sdAUC, ymin = meanAUC-sdAUC), position = "dodge") +
-  facet_wrap(~type, nrow = 2) +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
-```
+[univariate_AUROC.xlsx](./univariate_AUROC.xlsx)
 

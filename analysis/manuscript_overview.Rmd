@@ -1,10 +1,8 @@
 ---
 title: "Overview of BH3 profile"
 author: "Junyan Lu"
-date: "2020 Sept. 3"
-output: workflowr::wflow_html
-editor_options:
-  chunk_output_type: inline
+output: 
+    BiocStyle::html_document
 ---
 
 ```{r, echo=FALSE}
@@ -13,13 +11,13 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, autodep = 
 
 ```{r, warning=FALSE, message=FALSE, echo=FALSE}
 #Packages
-library(jyluMisc)
 library(qgraph)
 library(corrplot)
 library(cowplot)
 library(pheatmap)
 library(Cairo)
 library(limma)
+library(DESeq2)
 library(SummarizedExperiment)
 library(tidyverse)
 ```
@@ -29,9 +27,7 @@ library(tidyverse)
 Load
 ```{r, echo=FALSE, warning=FALSE}
 source("../code/utils.R")
-
-load("../output/dynamicBH3.RData")
-load("../../var/patmeta_200806.RData")
+load("../data/allData.RData")
 ```
 
   
@@ -68,19 +64,6 @@ geneColor <- c("HP" = colList[4], "IP" = colList[5], "LP" = colList[6],
 
 ```
 
-Save a table of patient information
-```{r, eval = FALSE}
-#library(DBI)
-#con <- dbConnect(RPostgreSQL::PostgreSQL(),
-#                 dbname = "tumorbank",
-#                 host = "huber-vm01.embl.de",
-#                 user = "admin",
-#                 password = "bloodcancertumorbank")
-
-#smpTab <- tbl(con, "sample") %>% collect()
-#sampleTab <- left_join(patAnno, smpTab, by = c(sampleID = "smpsampleid"))
-#write_csv2(sampleTab, "./tableS1_sampleSummary.csv")
-```
 
 # Data structure
 
@@ -112,7 +95,7 @@ ggplot(plotTab, aes(x=peptide, y = value)) +
   scale_fill_brewer(type = "seq", palette="RdYlBu",direction =1) +
   theme_full + theme(legend.position = "none") +
   ylab("Cyt C release (%)") + xlab("")
-ggsave("../figures/Fig1B.pdf", width = 10, height = 4, device = cairo_pdf)
+#ggsave("../figures/Fig1B.pdf", width = 10, height = 4, device = cairo_pdf)
 ```
 
 ### For AUC
@@ -147,7 +130,7 @@ plotList <- lapply(unique(plotTab$peptide), function(n) {
 })
 
 plot_grid(plotlist = plotList,ncol=2)
-ggsave("../figures/FigS1_doseResponse.pdf", width = 12, height = 15, device = cairo_pdf)
+#ggsave("../figures/FigS1_doseResponse.pdf", width = 12, height = 15, device = cairo_pdf)
 ```
 
 ## Hierarchical clustering and heatmaps
@@ -188,7 +171,7 @@ p <- pheatmap(dataMat.scaled, annotation_row = colAnno, scale = "none",
          breaks = seq(-3,3, length.out =100), treeheight_row = 0, treeheight_col = 10, fontsize_col  = 15,
          show_rownames = FALSE, clustering_method = "ward.D2", annotation_colors = colorAnno, clustering_callback = callback,silent = TRUE)
 plot_grid(p$gtable)
-ggsave("../figures/Fig1C_overviewHeatmap.pdf",p$gtable, height = 7, width = 7)
+#ggsave("../figures/Fig1C_overviewHeatmap.pdf",p$gtable, height = 7, width = 7)
 ```
 
 ## Pricipal component analysis
@@ -271,7 +254,7 @@ PCbiplot <- function(PC, x="PC1", y="PC2") {
 }
 
 PCbiplot(pcRes) + theme_full + theme(legend.position = c(0.81,0.15), legend.background = element_rect(fill = NA))
-ggsave("../figures/Fig1D_PCA.pdf", height = 5, width = 5)
+#ggsave("../figures/Fig1D_PCA.pdf", height = 5, width = 5)
 ```
 
 ### Associations between PCs and patient background
@@ -325,7 +308,7 @@ pList <- lapply(seq(nrow(corRes.sig)), function(i) {
 
 })
 cowplot::plot_grid(plotlist= pList, ncol=2)
-ggsave("../figures/Fig1E_boxplot.pdf", height = 6, width = 10)
+#ggsave("../figures/Fig1E_boxplot.pdf", height = 6, width = 10)
 ```
 
 **Plot feature loadings on the first three PCs**
@@ -382,9 +365,6 @@ featureCor <- cor.mtest(t(dataMat))
 
 #correlation heatmap
 corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
-pdf("../figures/FigS2_featureCorAUC.pdf", height = 5, width = 5)
-corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
-dev.off()
 ```
 
 
@@ -404,10 +384,122 @@ featureCor <- cor.mtest(t(dataMat))
 
 #correlation heatmap
 corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
-pdf("../figures/FigS3_featureCorConc.pdf", height = 10, width = 10)
-corrplot(featureCor[[1]],order="hclust",hclust.method = "ward.D2",p.mat = featureCor[[2]],sig.level = 0.01)
-dev.off()
 ```
+
+
+
+# Association with the spontaneous apoptosis of CLL cells
+
+## Measured by image data
+
+### PCs
+```{r}
+overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
+
+pcTab <-  pcRes$x[,1:2] %>% data.frame() %>%
+  rownames_to_column("patID") %>%
+  pivot_longer(-patID, names_to = "feature", values_to = "value")
+
+dataMat <- pcTab %>%
+  filter(patID %in% overSample) %>%
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+viabImg <- DMSO_viabilties[match(rownames(dataMat), DMSO_viabilties$NCT__Pat_ID),]
+
+corRes <- apply(dataMat, 2, function(x) {
+  res <- cor.test(x,viabImg$Absolute_viability_CLL)
+  data.frame(P.Value = res$p.value, coef = res$estimate)
+}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
+  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+```
+
+
+```{r corPCviabImg, fig.width=10, fig.height=5}
+pscr <- corRes
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  p <- pscr[i,]$P.Value
+  plotTab <- filter(pcTab, feature == featureName) %>%
+    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
+           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
+    filter(!is.na(viab)) %>%
+    mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
+           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
+    mutate(group = paste0(IGHV, tri12))
+  
+  ggplot(plotTab, aes(x=viab, y = value)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    ylab(featureName) + xlab("Percent live cells") +
+    ggtitle(paste0(featureName," ~ Viability")) +
+    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+pLegend <- get_legend(plotList[[1]]+theme(legend.text = element_text(size=14)))
+plot_grid(plot_grid(plotList[[1]] + theme(legend.position = "none"), 
+          plotList[[2]] + theme(legend.position = "none"), ncol=2),
+          pLegend, ncol=1, rel_heights = c(1,0.1))
+#ggsave("../figures/Fig1F_corPCviabImg.pdf", width = 10, height = 5)
+```
+
+### Individual peptide
+
+```{r, echo=FALSE}
+#correlation with viability data obtained by image analysis, no significant correlations
+overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
+dataMat <- dataBH3 %>% filter(patID %in% overSample) %>%
+  select(patID, feature, value) %>%
+  spread(key = feature, value = value) %>%
+  data.frame() %>% column_to_rownames("patID") %>%
+  as.matrix()
+
+viabImg <- DMSO_viabilties[match(rownames(dataMat), DMSO_viabilties$NCT__Pat_ID),]
+
+corRes <- apply(dataMat, 2, function(x) {
+  res <- cor.test(x,viabImg$Absolute_viability_CLL)
+  data.frame(P.Value = res$p.value, coef = res$estimate)
+}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
+  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
+  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
+```
+
+If multiple concentrations are identified as significant, only show the most significant concentration.
+```{r corViabImg, fig.width=14, fig.height=10, echo=FALSE, warning=FALSE}
+pscr <- filter(corRes, adj.P.Val < 0.10) %>%
+  arrange(P.Value) %>% distinct(peptide, .keep_all = TRUE)
+plotList <- lapply(seq(nrow(pscr)), function(i) {
+  featureName <- pscr[i,]$feature
+  p <- pscr[i,]$P.Value
+  plotTab <- filter(dataBH3, feature == featureName) %>%
+    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
+           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
+    filter(!is.na(viab)) %>% mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
+           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
+    mutate(group = paste0(IGHV, tri12))
+  
+  ggplot(plotTab, aes(x=viab, y = value)) + 
+    geom_point(aes(color = group, shape = group), size=3) + 
+     scale_color_manual(values = groupColor, name = "") +
+     scale_shape_manual(values = shapeAnno, name = "") + 
+    geom_smooth(method = "lm") +
+    ylab(featureName) + xlab("Percent live cells") +
+    ggtitle(paste0(featureName," ~ Viability")) +
+    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
+    theme_full + theme(legend.position ="bottom")
+})
+
+cowplot::plot_grid(plotlist = plotList, ncol=3)
+```
+
 
 # Association test with patient genomic background
 
@@ -499,6 +591,7 @@ resTab <- bind_rows(resTab.gene, resTab.meth) %>%
   ungroup() %>%
   mutate(p.adj = p.adjust(p.value, method = "BH")) %>%
   arrange(p.value)
+
 ```
 
 ## Table of associations
@@ -539,7 +632,7 @@ pSumPlot <- ggplot(plotTab, aes(x=feature, y = -log10(p.value), col = direction)
   xlab("") + ylab(bquote(-log[10]~"("*italic("P")~"value)"))
 
 pSumPlot
-ggsave("../figures/Fig2A_genePscatter.pdf", width = 5, height = 6)
+#ggsave("../figures/Fig2A_genePscatter.pdf", width = 5, height = 6)
 ```
 
 ## Box plots for the significant associations (10% FDR)
@@ -575,7 +668,7 @@ plotList <- lapply(seq(nrow(pscr)), function(i) {
     theme(legend.position = "none")
 })
 cowplot::plot_grid(plotlist = plotList, ncol=2)
-ggsave("../figures/Fig2B_geneAssociationBox.pdf", width = 10, height = 10)
+#ggsave("../figures/Fig2B_geneAssociationBox.pdf", width = 10, height = 10)
 ```
 
 
@@ -624,7 +717,7 @@ pSumHeat <- ggplot(plotTab, aes(x=factor(conc), y = Gene, fill = pSign)) + geom_
                      axis.text.x = element_text(size=14, angle = 90, hjust = 1, vjust = 0.5)) +
   ylab("Gene") + xlab("Concentration")
 pSumHeat
-ggsave("../figures/FigS4A_genePheatmapConc.pdf", height = 5, width = 12)
+#ggsave("../figures/FigS4A_genePheatmapConc.pdf", height = 5, width = 12)
 ```
 
 # Associations with pretreatment status
@@ -755,7 +848,7 @@ Table for comparing results
 compareTab <- left_join(resTab, resTab.pre) %>% left_join(resTab.untr) %>%
   mutate(ifSig = p.adj < 0.2) %>%
   mutate(pair = paste0(feature, "~", Gene))
-write_csv2(filter(compareTab, ifSig), "pretreatment_effect_estiamtion.csv")
+#write_csv2(filter(compareTab, ifSig), "pretreatment_effect_estiamtion.csv")
 ```
 
 ```{r comparePretreat, fig.height=6, fig.width=12}
@@ -791,17 +884,6 @@ plot_grid(p1,p2)
 
 RNAseq
 ```{r}
-load("../../var/ddsrna_180717.RData")
-
-#subset
-ddsSub <- dds[,dds$PatID %in% dataBH3$patID]
-
-#only keep protein coding genes with symbol
-ddsSub <- ddsSub[rowData(ddsSub)$biotype %in% "protein_coding" & !rowData(ddsSub)$symbol %in% c("",NA),]
-
-#remove lowly expressed genes
-ddsSub <- ddsSub[rowSums(counts(ddsSub, normalized = TRUE)) > 100,]
-
 #voom transformation
 exprMat <- limma::voom(counts(ddsSub), lib.size = ddsSub$sizeFactor)$E
 ddsSub.voom <- ddsSub
@@ -856,7 +938,7 @@ ggplot(plotTab, aes(x=feature, y=n)) + geom_bar(stat = "identity") + theme_full 
   theme(axis.text.x = element_text(angle = 90, hjust=1,vjust=0.5)) +
   xlab("") + ylab("Number of \nsignificant associations\n(10% FDR)")
 sumTab
-ggsave("../figures/FigS5_RNA_num_associations.pdf", height = 4, width = 8)
+#ggsave("../figures/FigS5_RNA_num_associations.pdf", height = 4, width = 8)
 ```
 
 ### Table of significant associations
@@ -1051,7 +1133,7 @@ plot_grid(pABT + theme(legend.position = "none",
           pBAD, 
           ncol=1, rel_heights = c(1,0.1,1.2),
           align = "v")
-ggsave("../figures/Fig3A_CorPlot.pdf", height = 10, width = 16)
+#ggsave("../figures/Fig3A_CorPlot.pdf", height = 10, width = 16)
 ```
 
 ## Pathway enrichment analysis for features that associate with gene expression
@@ -1076,7 +1158,7 @@ names(enRes) <- feList
 ```{r HallmarkEnrich, fig.width=8, fig.height=4}
 pList <- lapply(enRes, function(n) n$enrichPlot)
 plot_grid(plotlist = pList, ncol=1, rel_heights = c(2,3,3), align = "hv")
-ggsave("../figures/Fig3B_HallmarkEnrich.pdf", width = 8, height = 4)
+#ggsave("../figures/Fig3B_HallmarkEnrich.pdf", width = 8, height = 4)
 ```
 
 ### KEGG
@@ -1137,9 +1219,9 @@ plotSetHeatmap <- function(geneSigTab, setDir, setName, exprMat, colAnno, scale 
 ```{r NFKB_geneExpression,fig.height=4, fig.width=8}
 plotRes <- filter(allRes, feature == "ABT199", P.Value < 0.01)
 colAnno <- data.frame(dataMat)[,"ABT199", drop=FALSE]
-pdf("../figures/Fig3C_NFKB_heatmap.pdf", height = 4, width = 7)
+#pdf("../figures/Fig3C_NFKB_heatmap.pdf", height = 4, width = 7)
 plotSetHeatmap(plotRes, gmts$H, "HALLMARK_TNFA_SIGNALING_VIA_NFKB",exprMat = exprMat, colAnno = colAnno)
-dev.off()
+#dev.off()
 ```
 
 # Association with proteomics
@@ -1148,19 +1230,9 @@ dev.off()
 
 Proteomics
 ```{r}
-load("../../var/proteomic_LUMOS_batch13.RData")
-
-#subset
-protSub <- protCLL[,colnames(protCLL) %in% dataBH3$patID]
-
 exprMat <- assays(protSub)[["log2Norm"]]
 
-#remove invariate proteins
-#sds <- genefilter::rowSds(exprMat, na.rm= TRUE)
-#exprMat <- exprMat[sds > genefilter::shorth(sds),]
-
 dim(exprMat)
-
 
 ```
 
@@ -1191,7 +1263,6 @@ allRes <- lapply(colnames(dataMat), function(n) {
     data.frame(stringsAsFactors = FALSE) %>%
     rownames_to_column("id") %>% mutate(symbol = rowData(protSub[id,])$hgnc_symbol, feature = n)
 }) %>% bind_rows() %>% arrange(P.Value)
-
 ```
 
 ### Number of significant associations per feature (10% FDR)
@@ -1243,170 +1314,6 @@ plot_grid(plotlist = plotList, ncol=3)
 
 
 
-
-# Association with the spontaneous apoptosis of CLL cells
-
-
-## Measured by image data
-
-### PCs
-```{r}
-load("../../var/DMSO_Viabilities_Monoculture.RData")
-overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
-
-pcTab <-  pcRes$x[,1:2] %>% data.frame() %>%
-  rownames_to_column("patID") %>%
-  pivot_longer(-patID, names_to = "feature", values_to = "value")
-
-dataMat <- pcTab %>%
-  filter(patID %in% overSample) %>%
-  select(patID, feature, value) %>%
-  spread(key = feature, value = value) %>%
-  data.frame() %>% column_to_rownames("patID") %>%
-  as.matrix()
-
-viabImg <- DMSO_viabilties[match(overSample, DMSO_viabilties$NCT__Pat_ID),]
-
-corRes <- apply(dataMat, 2, function(x) {
-  res <- cor.test(x,viabImg$Absolute_viability_CLL)
-  data.frame(P.Value = res$p.value, coef = res$estimate)
-}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
-  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
-  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
-```
-
-
-```{r corPCviabImg, fig.width=10, fig.height=5}
-pscr <- corRes
-plotList <- lapply(seq(nrow(pscr)), function(i) {
-  featureName <- pscr[i,]$feature
-  p <- pscr[i,]$P.Value
-  plotTab <- filter(pcTab, feature == featureName) %>%
-    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
-           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
-           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
-    filter(!is.na(viab)) %>%
-    mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
-           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
-    mutate(group = paste0(IGHV, tri12))
-  
-  ggplot(plotTab, aes(x=viab, y = value)) + 
-    geom_point(aes(color = group, shape = group), size=3) + 
-     scale_color_manual(values = groupColor, name = "") +
-     scale_shape_manual(values = shapeAnno, name = "") + 
-    geom_smooth(method = "lm") +
-    ylab(featureName) + xlab("Percent live cells") +
-    ggtitle(paste0(featureName," ~ Viability")) +
-    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
-    theme_full + theme(legend.position ="bottom")
-})
-
-pLegend <- get_legend(plotList[[1]]+theme(legend.text = element_text(size=14)))
-plot_grid(plot_grid(plotList[[1]] + theme(legend.position = "none"), 
-          plotList[[2]] + theme(legend.position = "none"), ncol=2),
-          pLegend, ncol=1, rel_heights = c(1,0.1))
-ggsave("../figures/Fig1F_corPCviabImg.pdf", width = 10, height = 5)
-```
-
-### Individual peptide
-
-```{r, echo=FALSE}
-#correlation with viability data obtained by image analysis, no significant correlations
-overSample <- intersect(dataBH3$patID, DMSO_viabilties$NCT__Pat_ID)
-dataMat <- dataBH3 %>% filter(patID %in% overSample) %>%
-  select(patID, feature, value) %>%
-  spread(key = feature, value = value) %>%
-  data.frame() %>% column_to_rownames("patID") %>%
-  as.matrix()
-
-viabImg <- DMSO_viabilties[match(overSample, DMSO_viabilties$NCT__Pat_ID),]
-
-corRes <- apply(dataMat, 2, function(x) {
-  res <- cor.test(x,viabImg$Absolute_viability_CLL)
-  data.frame(P.Value = res$p.value, coef = res$estimate)
-}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
-  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
-  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
-```
-
-If multiple concentrations are identified as significant, only show the most significant concentration.
-```{r corViabImg, fig.width=14, fig.height=10, echo=FALSE, warning=FALSE}
-pscr <- filter(corRes, adj.P.Val < 0.10) %>%
-  arrange(P.Value) %>% distinct(peptide, .keep_all = TRUE)
-plotList <- lapply(seq(nrow(pscr)), function(i) {
-  featureName <- pscr[i,]$feature
-  p <- pscr[i,]$P.Value
-  plotTab <- filter(dataBH3, feature == featureName) %>%
-    mutate(viab = viabImg[match(patID, viabImg$NCT__Pat_ID),]$Absolute_viability_CLL,
-           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
-           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
-    filter(!is.na(viab)) %>% mutate(IGHV = ifelse(IGHV == "M","M-CLL,", "U-CLL,"),
-           tri12 = ifelse(trisomy12 == 1," tri12"," no tri12")) %>%
-    mutate(group = paste0(IGHV, tri12))
-  
-  ggplot(plotTab, aes(x=viab, y = value)) + 
-    geom_point(aes(color = group, shape = group), size=3) + 
-     scale_color_manual(values = groupColor, name = "") +
-     scale_shape_manual(values = shapeAnno, name = "") + 
-    geom_smooth(method = "lm") +
-    ylab(featureName) + xlab("Percent live cells") +
-    ggtitle(paste0(featureName," ~ Viability")) +
-    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
-    theme_full + theme(legend.position ="bottom")
-})
-
-cowplot::plot_grid(plotlist = plotList, ncol=3)
-```
-
-
-## Association with basline Annexin data
-```{r}
-load("../output/dataAnnexin.RData")
-baseTab <- filter(dataAnnexin, drug =="DMSO",conc == 0) %>%
-  group_by(patID) %>% summarise(viab = mean(Viability))
-
-overSample <- intersect(dataBH3$patID, baseTab$patID)
-
-dataMat <- dataBH3 %>% filter(patID %in% overSample) %>%
-  select(patID, feature, value) %>%
-  spread(key = feature, value = value) %>%
-  data.frame() %>% column_to_rownames("patID") %>%
-  as.matrix()
-dataMat <- dataMat[overSample,]
-viabAnn <- baseTab[match(overSample, baseTab$patID),]$viab
-
-corRes <- apply(dataMat, 2, function(x) {
-  res <- cor.test(x,viabAnn)
-  data.frame(P.Value = res$p.value, coef = res$estimate)
-}) %>% bind_rows() %>% mutate(feature = colnames(dataMat)) %>%
-  arrange(P.Value) %>% mutate(adj.P.Val = p.adjust(P.Value, method = "BH")) %>%
-  left_join(distinct(dataBH3, feature, peptide, conc, concIndex), by = "feature")
-corRes
-```
-No significant correlations?
-
-```{r corViabAnn, fig.width=14, fig.height=15, echo=FALSE, warning=FALSE}
-pscr <- corRes
-plotList <- lapply(seq(nrow(pscr)), function(i) {
-  featureName <- pscr[i,]$feature
-  p <- pscr[i,]$P.Value
-  plotTab <- filter(dataBH3, feature == featureName) %>%
-    mutate(viab = baseTab[match(patID, baseTab$patID),]$viab,
-           IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
-           trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12) %>%
-    filter(!is.na(viab))
-  ggplot(plotTab, aes(x=viab, y = value)) + 
-    geom_point(aes(shape = IGHV, col = trisomy12),size=3) + geom_smooth(method = "lm") +
-    ylab("Cyt C release") + xlab("Percent live cells") +
-    scale_shape_manual(values = c(M=20, U=1)) +
-    ggtitle(featureName) +
-    annotate("text", label = paste0 ("P = ",formatC(p, format = "e", digits = 2)), y=Inf, x=Inf, col = colList[1], hjust=1.2, vjust=2) +
-    scale_color_manual(values = geneColor[c("tri12","WT")]) +
-    theme_full + theme(legend.position ="bottom")
-})
-
-cowplot::plot_grid(plotlist = plotList, ncol=3)
-```
 
 
 # Multivariate feature selection for explaining BH3 profling in CLL
@@ -1639,7 +1546,7 @@ runGlm <- function(X, y, method = "ridge", repeats=20, folds = 3) {
 ```
 
 Perform lasso regression
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
+```{r, warning=FALSE, message=FALSE}
 library(glmnet)
 lassoResults <- list()
 for (eachMeasure in names(cleanData$allResponse)) {
@@ -1655,40 +1562,6 @@ for (eachMeasure in names(cleanData$allResponse)) {
   lassoResults[[eachMeasure]] <- dataResult
   
 }
-```
-
-
-
-
-#### Ploting R2
-
-Function for plotting variance explained for each measurement
-```{r varExpLASSO, fig.height=15, fig.width=20, echo=F, warning=FALSE, message=FALSE}
-plotVar <- function(glmResult) {
-  
-  pList <- lapply(names(glmResult), function(n) {
-     plotTab <- lapply(names(glmResult[[n]]), function(x) {
-       tibble(variable = x, value = glmResult[[n]][[x]]$varExplain)}) %>% 
-       bind_rows() %>% group_by(variable) %>% 
-       summarise(mean=mean(value, na.rm = TRUE),sd=sd(value, na.rm=TRUE))
-     
-     ggplot(plotTab,aes(x=variable, y=mean, fill= variable)) + 
-       geom_bar(position=position_dodge(), stat="identity", width = 0.8, col="black") + 
-       geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd, width = 0.3), position=position_dodge(.9)) + 
-       theme_classic() + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size =12), 
-                            plot.title = element_text(hjust =0.5),
-                            axis.text.y = element_text(size=12),
-                            axis.title = element_text(size=15),
-                            legend.position = "none") + 
-       scale_fill_brewer("Set1",type = "qual") + coord_cartesian(ylim = c(0,1)) +
-       ylab("R2") + xlab("") + ggtitle(paste0("Variance explained for ",n))
-  })
-  pList
-}
-
-varList <- plotVar(lassoResults)
-
-cowplot::plot_grid(plotlist = varList, ncol=3)
 ```
 
 
@@ -1849,68 +1722,3 @@ plot_grid(plotlist=heatMaps, ncol=1)
 ```
 
 
-### Multivariate linear regression without LASSO penalty
-
-#### Training model
-
-Function for multi-variate regression without lasso penalty
-```{r }
-runLm <- function(X, y, repeats=20) {
-  modelList <- list()
-  varExplain <- c()
-  coefMat <- matrix(NA, ncol(X), repeats)
-  rownames(coefMat) <- colnames(X)
-  
-  for (i in seq(repeats)) {
-    res <- summary(lm(y~., data.frame(X)))
-    modelList[[i]] <- res
-    coefModel <- res$coefficients[-1,]
-    coefMat[,i] <- sign(coefModel[,1]) * (-log10(coefModel[,4]))
-    varExp <- res$adj.r.squared
-    varExplain <- c(varExplain, varExp)
-  }
-  list(modelList = modelList, varExplain = varExplain, coefMat = coefMat)
-}
-```
-
-Perform linear regression without penalization
-```{r, cache=TRUE, warning=FALSE, message=FALSE}
-lmResults <- list()
-for (eachMeasure in names(cleanData$allResponse)) {
-  dataResult <- list()
-  for (eachDataset in names(cleanData$allExplain[[eachMeasure]])) {
-    y <- cleanData$allResponse[[eachMeasure]]
-    X <- cleanData$allExplain[[eachMeasure]][[eachDataset]]
-  
-   
-    glmRes <- runLm(X, y, repeats = 3)
-    dataResult[[eachDataset]] <- glmRes 
-  }
-  lmResults[[eachMeasure]] <- dataResult
-  
-}
-```
-
-
-#### Ploting R2
-
-```{r varExpLM, fig.height=15, fig.width=20, echo=F, warning=FALSE, message=FALSE}
-varList <- plotVar(lmResults)
-
-cowplot::plot_grid(plotlist = varList, ncol=3)
-```
-
-
-
-#### Heatmap of selected features, without lasso penalty (0.1 Pvalue)
-Plot all heatmaps
-```{r}
-heatMaps <- lassoPlot(lmResults, cleanData, freqCut = 1, coefCut = 1)
-```
-
-```{r heatmapLM, fig.height=4, fig.width=18}
-heatMaps <- heatMaps[!is.na(heatMaps)]
-plot_grid(heatMaps[[1]], heatMaps[[2]],
-          heatMaps[[4]], heatMaps[[5]], ncol=2)
-ggsave("../figures/Fig2C_lassoBH.pdf", height = 4, width = 18)
-```
